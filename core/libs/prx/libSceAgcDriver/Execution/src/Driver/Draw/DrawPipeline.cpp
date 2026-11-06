@@ -393,9 +393,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         const auto share = [](std::uint64_t repeated, std::uint64_t total) { return total == 0 ? 0.0 : 100.0 * static_cast<double>(repeated) / static_cast<double>(total); };
         AgcDriver::ProfilePrint_nid_no_patch("[draw] command volume (10 s): %llu commits, %llu draws, %llu pipeline binds, %llu descriptor set binds, %llu push constant calls, %llu dynamic state calls\n", static_cast<unsigned long long>(commits), static_cast<unsigned long long>(drawCalls), static_cast<unsigned long long>(pipelineBinds), static_cast<unsigned long long>(descriptorBinds), static_cast<unsigned long long>(pushCalls), static_cast<unsigned long long>(libraryStates * Graphics::LibraryStateCommands));
         AgcDriver::ProfilePrint_nid_no_patch("[draw] command repeats (10 s): pipeline %llu (%.1f%%), set %llu (%.1f%%), push %llu (%.1f%%)\n", static_cast<unsigned long long>(pipelineRepeated), share(pipelineRepeated, pipelineBinds), static_cast<unsigned long long>(descriptorRepeated), share(descriptorRepeated, descriptorBinds), static_cast<unsigned long long>(pushRepeated), share(pushRepeated, pushCalls));
+        const auto perCommit = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(count); };
+        AgcDriver::ProfilePrint_nid_no_patch("[draw] commit split (10 s): %llu draw commits at %.1f us (%llu total), %llu other commits at %.1f us (%llu total); other share %.1f%% of commit time\n", static_cast<unsigned long long>(drawCommits), perCommit(drawCommitNs, drawCommits), static_cast<unsigned long long>(drawCommitNs), static_cast<unsigned long long>(otherCommits), perCommit(otherCommitNs, otherCommits), static_cast<unsigned long long>(otherCommitNs), commitNs == 0 ? 0.0 : 100.0 * static_cast<double>(otherCommitNs) / static_cast<double>(commitNs));
     }
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
+    drawCommits = drawCommitNs = otherCommits = otherCommitNs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -445,6 +448,13 @@ void DrawPipeline::run() {
         retiredItems.fetch_add(1, std::memory_order_release);
         ++commits;
         commitNs += spent;
+        if (isDraw) {
+            ++drawCommits;
+            drawCommitNs += spent;
+        } else {
+            ++otherCommits;
+            otherCommitNs += spent;
+        }
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);

@@ -103,6 +103,10 @@ private:
     std::thread thread;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
+    std::uint64_t drawCommits = 0;
+    std::uint64_t drawCommitNs = 0;
+    std::uint64_t otherCommits = 0;
+    std::uint64_t otherCommitNs = 0;
     std::uint64_t commitErrors = 0;
     std::uint64_t enqueued = 0;
     std::uint64_t fullWaitNs = 0;
