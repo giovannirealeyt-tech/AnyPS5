@@ -534,12 +534,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const std::array<VkDescriptorSetLayout, 4> setLayouts{resources.main, (pixelLds || meshWindow) && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLds ? pixelLdsLayouts.buffer : pixelLdsLayouts.empty, meshWindow ? MeshWindowSetLayout(context) : VK_NULL_HANDLE};
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
+        // One range for both slots lets PushConstants issue a single vkCmdPushConstants per
+        // draw instead of two (APS5_PUSH_SINGLE_RANGE, default off).
+        const VkPushConstantRange merged{pushStagesOf(context) | VK_SHADER_STAGE_FRAGMENT_BIT, 0, PipelinePushSlotBytes * 2};
+        const bool singleRange = dynamicRendering && Graphics::SinglePushRange();
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.flags = pixelLds || meshWindow || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
         layoutInfo.setLayoutCount = meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
-        layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
-        layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
+        layoutInfo.pushConstantRangeCount = dynamicRendering ? (singleRange ? 1u : static_cast<std::uint32_t>(slots.size())) : pushStages != 0 ? 1 : 0;
+        layoutInfo.pPushConstantRanges = dynamicRendering ? (singleRange ? &merged : slots.data()) : pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
@@ -986,6 +990,11 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) c
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
     if (stages == 0) return;
+    if (dynamicRendering && Graphics::SinglePushRange()) {
+        Graphics::NotePushConstants(commands, bytes.data(), PipelinePushSlotBytes * 2, 1);
+        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context) | VK_SHADER_STAGE_FRAGMENT_BIT, 0, PipelinePushSlotBytes * 2, bytes.data());
+        return;
+    }
     Graphics::NotePushConstants(commands, bytes.data(), dynamicRendering ? PipelinePushSlotBytes * 2 : PipelinePushSlotBytes, dynamicRendering ? 2 : 1);
     if (dynamicRendering) {
         context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());

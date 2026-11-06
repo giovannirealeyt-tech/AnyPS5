@@ -36,6 +36,14 @@ inline CommandCallCounters& commandCallCounters() {
 // bounds test, stencil test, and op/compare/write/reference for both faces).
 inline constexpr std::uint64_t LibraryStateCommands = 17;
 
+// APS5_PUSH_SINGLE_RANGE=1 declares one push-constant range covering both slots
+// (default off). With two ranges the driver must issue two vkCmdPushConstants per
+// draw, because a call may not write outside a stage's declared range.
+inline bool SinglePushRange() {
+    static const bool enabled = std::getenv("APS5_PUSH_SINGLE_RANGE") != nullptr;
+    return enabled;
+}
+
 // Last bind state per recording thread and command buffer. Bindings persist only
 // inside a command buffer, so a different command buffer invalidates everything.
 struct LastBoundState {
