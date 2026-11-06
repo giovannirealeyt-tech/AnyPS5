@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -379,6 +380,20 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[96];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
+    auto& commandCalls = Graphics::commandCallCounters();
+    const auto pipelineBinds = commandCalls.pipelineBinds.exchange(0, std::memory_order_relaxed);
+    const auto libraryStates = commandCalls.libraryStates.exchange(0, std::memory_order_relaxed);
+    const auto descriptorBinds = commandCalls.descriptorSetBinds.exchange(0, std::memory_order_relaxed);
+    const auto pushCalls = commandCalls.pushConstantCalls.exchange(0, std::memory_order_relaxed);
+    const auto pipelineRepeated = commandCalls.pipelineBindsRepeated.exchange(0, std::memory_order_relaxed);
+    const auto descriptorRepeated = commandCalls.descriptorSetBindsRepeated.exchange(0, std::memory_order_relaxed);
+    const auto pushRepeated = commandCalls.pushConstantsRepeated.exchange(0, std::memory_order_relaxed);
+    const auto drawCalls = commandCalls.drawCalls.exchange(0, std::memory_order_relaxed);
+    if (commits != 0) {
+        const auto share = [](std::uint64_t repeated, std::uint64_t total) { return total == 0 ? 0.0 : 100.0 * static_cast<double>(repeated) / static_cast<double>(total); };
+        AgcDriver::ProfilePrint_nid_no_patch("[draw] command volume (10 s): %llu commits, %llu draws, %llu pipeline binds, %llu descriptor set binds, %llu push constant calls, %llu dynamic state calls\n", static_cast<unsigned long long>(commits), static_cast<unsigned long long>(drawCalls), static_cast<unsigned long long>(pipelineBinds), static_cast<unsigned long long>(descriptorBinds), static_cast<unsigned long long>(pushCalls), static_cast<unsigned long long>(libraryStates * Graphics::LibraryStateCommands));
+        AgcDriver::ProfilePrint_nid_no_patch("[draw] command repeats (10 s): pipeline %llu (%.1f%%), set %llu (%.1f%%), push %llu (%.1f%%)\n", static_cast<unsigned long long>(pipelineRepeated), share(pipelineRepeated, pipelineBinds), static_cast<unsigned long long>(descriptorRepeated), share(descriptorRepeated, descriptorBinds), static_cast<unsigned long long>(pushRepeated), share(pushRepeated, pushCalls));
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};

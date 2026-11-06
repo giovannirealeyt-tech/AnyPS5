@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -6418,8 +6419,14 @@ void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout lay
     requireGuestBuffers();
     const auto set = use->bindings->allocation.set;
     const auto fragmentSet = use->bindings->fragmentAllocation.set;
-    if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
-    if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+    if (set != VK_NULL_HANDLE) {
+        Graphics::NoteDescriptorSetBind(commands, static_cast<const void*>(layout), static_cast<const void*>(set), false);
+        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
+    }
+    if (fragmentSet != VK_NULL_HANDLE) {
+        Graphics::NoteDescriptorSetBind(commands, static_cast<const void*>(layout), static_cast<const void*>(fragmentSet), true);
+        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+    }
 }
 
 void ShaderResources::prepareFaultSlot() const {
@@ -6461,8 +6468,14 @@ void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoi
     prepareFaultSlot();
     const VkDescriptorSet mainSet = bindings != nullptr && bindings->allocation.set != VK_NULL_HANDLE ? bindings->allocation.set : _set;
     const VkDescriptorSet fragmentSet = bindings != nullptr && bindings->fragmentAllocation.set != VK_NULL_HANDLE ? bindings->fragmentAllocation.set : fragment.set;
-    if (mainSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &mainSet, 0, nullptr);
-    if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+    if (mainSet != VK_NULL_HANDLE) {
+        Graphics::NoteDescriptorSetBind(commands, static_cast<const void*>(layout), static_cast<const void*>(mainSet), false);
+        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &mainSet, 0, nullptr);
+    }
+    if (fragmentSet != VK_NULL_HANDLE) {
+        Graphics::NoteDescriptorSetBind(commands, static_cast<const void*>(layout), static_cast<const void*>(fragmentSet), true);
+        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+    }
 }
 
 namespace {
