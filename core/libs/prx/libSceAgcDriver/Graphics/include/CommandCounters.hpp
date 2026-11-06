@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_COMMANDCOUNTERS_HPP
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -43,6 +44,107 @@ inline bool SinglePushRange() {
     static const bool enabled = std::getenv("APS5_PUSH_SINGLE_RANGE") != nullptr;
     return enabled;
 }
+
+// APS5_COMMIT_SPLIT=1: coarse split of one draw commit, measured on the committer
+// thread without APS5_PROFILE_DRAW (which would disable the handoff). The total is
+// taken around Graphics::Draw with an RAII guard, so early returns and exceptions
+// stay inside it; the phase marks are inside recordDrawCommandsImpl. A draw whose
+// marks were not all reached is counted as unclassified and contributes only to the
+// total, which is what makes total == setup + begin + record + finish + unclassified.
+struct CommitSplitCounters {
+    std::atomic<std::uint64_t> totalNs{0};
+    std::atomic<std::uint64_t> setupNs{0};
+    std::atomic<std::uint64_t> beginNs{0};
+    std::atomic<std::uint64_t> recordNs{0};
+    std::atomic<std::uint64_t> finishNs{0};
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> unclassified{0};
+};
+
+inline CommitSplitCounters& commitSplitCounters() {
+    static CommitSplitCounters counters;
+    return counters;
+}
+
+inline bool CommitSplitEnabled() {
+    static const bool enabled = std::getenv("APS5_COMMIT_SPLIT") != nullptr;
+    return enabled;
+}
+
+struct CommitSplitState {
+    std::uint64_t started = 0, markBegin = 0, markRecord = 0, markDraw = 0;
+    bool active = false, hasBegin = false, hasRecord = false, hasDraw = false;
+};
+
+inline CommitSplitState& commitSplitState() {
+    static thread_local CommitSplitState state;
+    return state;
+}
+
+inline std::uint64_t CommitSplitNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+inline void CommitSplitStart() {
+    auto& state = commitSplitState();
+    state = CommitSplitState{};
+    if (!CommitSplitEnabled()) return;
+    state.active = true;
+    state.started = CommitSplitNow();
+}
+
+inline void CommitSplitMarkBegin() {
+    auto& state = commitSplitState();
+    if (!state.active) return;
+    state.markBegin = CommitSplitNow();
+    state.hasBegin = true;
+}
+
+inline void CommitSplitMarkRecord() {
+    auto& state = commitSplitState();
+    if (!state.active) return;
+    state.markRecord = CommitSplitNow();
+    state.hasRecord = true;
+}
+
+inline void CommitSplitMarkDraw() {
+    auto& state = commitSplitState();
+    if (!state.active) return;
+    state.markDraw = CommitSplitNow();
+    state.hasDraw = true;
+}
+
+inline void CommitSplitFinish() {
+    auto& state = commitSplitState();
+    if (!state.active) return;
+    state.active = false;
+    const auto end = CommitSplitNow();
+    auto& counters = commitSplitCounters();
+    const auto total = end - state.started;
+    counters.totalNs.fetch_add(total, std::memory_order_relaxed);
+    if (!state.hasBegin || !state.hasRecord || !state.hasDraw || state.markBegin < state.started || state.markRecord < state.markBegin || state.markDraw < state.markRecord || end < state.markDraw) {
+        counters.unclassified.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto setup = state.markBegin - state.started;
+    const auto begin = state.markRecord - state.markBegin;
+    const auto record = state.markDraw - state.markRecord;
+    const auto finish = end - state.markDraw;
+    counters.setupNs.fetch_add(setup, std::memory_order_relaxed);
+    counters.beginNs.fetch_add(begin, std::memory_order_relaxed);
+    counters.recordNs.fetch_add(record, std::memory_order_relaxed);
+    counters.finishNs.fetch_add(finish, std::memory_order_relaxed);
+    counters.draws.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Scope guard: starts at Graphics::Draw entry and always finishes, including the
+// early returns and the exception path.
+struct CommitSplitScope {
+    CommitSplitScope() { CommitSplitStart(); }
+    ~CommitSplitScope() { CommitSplitFinish(); }
+    CommitSplitScope(const CommitSplitScope&) = delete;
+    CommitSplitScope& operator=(const CommitSplitScope&) = delete;
+};
 
 // Last bind state per recording thread and command buffer. Bindings persist only
 // inside a command buffer, so a different command buffer invalidates everything.

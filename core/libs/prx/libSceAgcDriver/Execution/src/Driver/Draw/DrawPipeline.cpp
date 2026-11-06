@@ -395,6 +395,19 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         AgcDriver::ProfilePrint_nid_no_patch("[draw] command repeats (10 s): pipeline %llu (%.1f%%), set %llu (%.1f%%), push %llu (%.1f%%)\n", static_cast<unsigned long long>(pipelineRepeated), share(pipelineRepeated, pipelineBinds), static_cast<unsigned long long>(descriptorRepeated), share(descriptorRepeated, descriptorBinds), static_cast<unsigned long long>(pushRepeated), share(pushRepeated, pushCalls));
         const auto perCommit = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(count); };
         AgcDriver::ProfilePrint_nid_no_patch("[draw] commit split (10 s): %llu draw commits at %.1f us (%llu total), %llu other commits at %.1f us (%llu total); other share %.1f%% of commit time\n", static_cast<unsigned long long>(drawCommits), perCommit(drawCommitNs, drawCommits), static_cast<unsigned long long>(drawCommitNs), static_cast<unsigned long long>(otherCommits), perCommit(otherCommitNs, otherCommits), static_cast<unsigned long long>(otherCommitNs), commitNs == 0 ? 0.0 : 100.0 * static_cast<double>(otherCommitNs) / static_cast<double>(commitNs));
+        auto& split = Graphics::commitSplitCounters();
+        const auto splitTotal = split.totalNs.exchange(0, std::memory_order_relaxed);
+        const auto splitSetup = split.setupNs.exchange(0, std::memory_order_relaxed);
+        const auto splitBegin = split.beginNs.exchange(0, std::memory_order_relaxed);
+        const auto splitRecord = split.recordNs.exchange(0, std::memory_order_relaxed);
+        const auto splitFinish = split.finishNs.exchange(0, std::memory_order_relaxed);
+        const auto splitDraws = split.draws.exchange(0, std::memory_order_relaxed);
+        const auto splitUnclassified = split.unclassified.exchange(0, std::memory_order_relaxed);
+        if (splitTotal != 0) {
+            const auto perDrawUs = [&](std::uint64_t ns) { return splitDraws == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(splitDraws); };
+            const auto classified = splitSetup + splitBegin + splitRecord + splitFinish;
+            AgcDriver::ProfilePrint_nid_no_patch("[draw] draw phases (10 s): %llu partite, %llu non classificate; setup %.1f us, begin+bind %.1f us, record %.1f us, finish %.1f us, totale esterno %.1f us; gap %.1f%%\n", static_cast<unsigned long long>(splitDraws), static_cast<unsigned long long>(splitUnclassified), perDrawUs(splitSetup), perDrawUs(splitBegin), perDrawUs(splitRecord), perDrawUs(splitFinish), splitDraws == 0 ? 0.0 : static_cast<double>(splitTotal) / 1e3 / static_cast<double>(splitDraws + splitUnclassified), splitTotal == 0 ? 0.0 : 100.0 * static_cast<double>(splitTotal - classified) / static_cast<double>(splitTotal));
+        }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
