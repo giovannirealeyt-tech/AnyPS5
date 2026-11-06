@@ -2833,9 +2833,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     } else {
         resources.BindDrawUse(commands, record.pipeline->Layout(), drawUse.get());
     }
+    Graphics::CommitSplitMarkSets();
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+    Graphics::CommitSplitMarkLds();
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     Graphics::CommitSplitMarkRecord();
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");

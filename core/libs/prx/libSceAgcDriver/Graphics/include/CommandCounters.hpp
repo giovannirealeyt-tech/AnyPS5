@@ -65,6 +65,9 @@ struct CommitSplitCounters {
     std::atomic<std::uint64_t> unclassified{0};
     std::atomic<std::uint64_t> setupNs{0};
     std::atomic<std::uint64_t> beginNs{0};
+    std::atomic<std::uint64_t> setsNs{0};
+    std::atomic<std::uint64_t> ldsNs{0};
+    std::atomic<std::uint64_t> pushNs{0};
     std::atomic<std::uint64_t> recordNs{0};
     std::atomic<std::uint64_t> finishNs{0};
     std::atomic<std::uint64_t> noBegin{0};      // classified draws with a reused pass
@@ -84,8 +87,8 @@ inline bool CommitSplitEnabled() {
 }
 
 struct CommitSplitState {
-    std::uint64_t started = 0, markBegin = 0, markRecord = 0, markDraw = 0;
-    bool active = false, hasBegin = false, hasRecord = false, hasDraw = false;
+    std::uint64_t started = 0, markBegin = 0, markSets = 0, markLds = 0, markRecord = 0, markDraw = 0;
+    bool active = false, hasBegin = false, hasSets = false, hasLds = false, hasRecord = false, hasDraw = false;
     int depth = 0; // Graphics::Draw recurses; only the outermost call measures
     int path = 0;  // 0 = Draw, 1 = DrawWithRecipe
 };
@@ -115,6 +118,20 @@ inline void CommitSplitMarkBegin() {
     if (!state.active || state.depth != 1 || state.hasBegin) return;
     state.markBegin = CommitSplitNow();
     state.hasBegin = true;
+}
+
+inline void CommitSplitMarkSets() {
+    auto& state = commitSplitState();
+    if (!state.active || state.depth != 1 || state.hasSets) return;
+    state.markSets = CommitSplitNow();
+    state.hasSets = true;
+}
+
+inline void CommitSplitMarkLds() {
+    auto& state = commitSplitState();
+    if (!state.active || state.depth != 1 || state.hasLds) return;
+    state.markLds = CommitSplitNow();
+    state.hasLds = true;
 }
 
 inline void CommitSplitMarkRecord() {
@@ -149,23 +166,27 @@ inline void CommitSplitFinish() {
     }
     const auto startOfRecord = state.hasBegin && state.markBegin >= state.started ? state.markBegin : state.started;
     if (!state.hasBegin) counters.noBegin.fetch_add(1, std::memory_order_relaxed);
-    if (state.markRecord < startOfRecord) {
+    if (state.markRecord < startOfRecord || !state.hasSets || !state.hasLds || state.markSets < startOfRecord || state.markLds < state.markSets || state.markRecord < state.markLds) {
         counters.unclassifiedNs.fetch_add(total, std::memory_order_relaxed);
         counters.unclassified.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const auto setup = startOfRecord - state.started;
-    const auto begin = state.markRecord - startOfRecord;
+    const auto begin = state.markSets - startOfRecord;
+    const auto sets = state.markLds - state.markSets;
+    const auto push = state.markRecord - state.markLds;
     const auto record = state.markDraw - state.markRecord;
     const auto finish = end - state.markDraw;
     counters.setupNs.fetch_add(setup, std::memory_order_relaxed);
     counters.beginNs.fetch_add(begin, std::memory_order_relaxed);
+    counters.setsNs.fetch_add(sets, std::memory_order_relaxed);
+    counters.pushNs.fetch_add(push, std::memory_order_relaxed);
     counters.recordNs.fetch_add(record, std::memory_order_relaxed);
     counters.finishNs.fetch_add(finish, std::memory_order_relaxed);
     counters.classifiedNs.fetch_add(total, std::memory_order_relaxed);
     counters.classified.fetch_add(1, std::memory_order_relaxed);
     if (state.path == 1) counters.recipeClassified.fetch_add(1, std::memory_order_relaxed);
-    if (setup + begin + record + finish > total) counters.violations.fetch_add(1, std::memory_order_relaxed);
+    if (setup + begin + sets + push + record + finish > total) counters.violations.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Scope guard: starts at the entry of Graphics::Draw / DrawWithRecipe and always
