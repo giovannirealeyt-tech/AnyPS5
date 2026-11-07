@@ -86,9 +86,85 @@ inline bool CommitSplitEnabled() {
     return enabled;
 }
 
+// Version 2 of the same scope: one mark per boundary, and every phase accumulated
+// only on the draws that reach its mark. The first version derived setup/begin by
+// subtraction from a start that moved with hasBegin, so prepareDraw was counted in
+// setup for a draw that opened its render pass and in begin for one that reused it,
+// and the two means could not be compared. A phase whose mark is not reached is not
+// counted at all; its time joins the next reached phase, so different populations
+// never mix. Each phase keeps its own sample count.
+//
+//   inputs      prepareDrawInputs: validation, index and vertex staging copies
+//   targets     the color/depth target loop: resident lookups, DCC, transfers
+//   resLookup   resolveDrawResources before a build: key, Find, Revalidate
+//   resBuild    the ShaderResources build of a miss (bindings, upload, sets)
+//   pipeline    indirect records, cache insert, masks, stencil pipelines, pipeline
+//   framebuffer owners, AcquireFramebuffer, pass depth locations
+//   descWrites  PrepareDrawBindings: this draw's vkUpdateDescriptorSets
+//   preBegin    barriers, proxies, staged clears before Pipeline::Begin
+//   passBegin   Pipeline::Begin alone (only draws that open a render pass)
+//   descBind    the vkCmdBindDescriptorSets of this draw's sets
+//   ldsBind     pixel-function LDS and mesh window binds
+//   push        vkCmdPushConstants
+//   record      the vkCmdDraw* calls, stencil replay, face/channel splits
+//   finish      everything after the last mark (keep, completion, the draw's dtor)
+//
+// Samples are accumulated per thread and merged every CommitSplitFlushDraws draws,
+// so no phase costs an atomic per draw; the report lags by up to that many draws
+// per thread, as the resource build profile already does.
+enum class CommitSplitPhase : std::size_t {
+    Inputs = 0, Targets, ResLookup, ResBuild, Pipeline, Framebuffer, DescWrites,
+    PreBegin, PassBegin, DescBind, LdsBind, Push, Record, Finish, Count
+};
+
+inline constexpr std::size_t CommitSplitPhaseCount = static_cast<std::size_t>(CommitSplitPhase::Count);
+// 0 = draw that opened its render pass, 1 = draw that reused it, 2 = everything
+// else (synchronous draws, early exits, DrawWithRecipe).
+inline constexpr std::size_t CommitSplitPopulations = 3;
+inline constexpr std::uint32_t CommitSplitFlushDraws = 64;
+
+struct CommitSplitV2Counters {
+    std::atomic<std::uint64_t> ns[CommitSplitPopulations][CommitSplitPhaseCount]{};
+    std::atomic<std::uint64_t> count[CommitSplitPopulations][CommitSplitPhaseCount]{};
+    std::atomic<std::uint64_t> draws[CommitSplitPopulations]{};
+    std::atomic<std::uint64_t> totalNs[CommitSplitPopulations]{};
+};
+
+inline CommitSplitV2Counters& commitSplitV2Counters() {
+    static CommitSplitV2Counters counters;
+    return counters;
+}
+
+struct CommitSplitPending {
+    std::uint64_t ns[CommitSplitPopulations][CommitSplitPhaseCount]{};
+    std::uint64_t count[CommitSplitPopulations][CommitSplitPhaseCount]{};
+    std::uint64_t draws[CommitSplitPopulations]{};
+    std::uint64_t totalNs[CommitSplitPopulations]{};
+    std::uint32_t drawsPending = 0;
+    void Flush() {
+        auto& counters = commitSplitV2Counters();
+        for (std::size_t population = 0; population < CommitSplitPopulations; ++population) {
+            counters.draws[population].fetch_add(draws[population], std::memory_order_relaxed);
+            counters.totalNs[population].fetch_add(totalNs[population], std::memory_order_relaxed);
+            for (std::size_t phase = 0; phase < CommitSplitPhaseCount; ++phase) {
+                counters.ns[population][phase].fetch_add(ns[population][phase], std::memory_order_relaxed);
+                counters.count[population][phase].fetch_add(count[population][phase], std::memory_order_relaxed);
+            }
+        }
+        *this = CommitSplitPending{};
+    }
+};
+
+inline CommitSplitPending& commitSplitPending() {
+    static thread_local CommitSplitPending pending;
+    return pending;
+}
+
 struct CommitSplitState {
-    std::uint64_t started = 0, markBegin = 0, markSets = 0, markLds = 0, markRecord = 0, markDraw = 0;
-    bool active = false, hasBegin = false, hasSets = false, hasLds = false, hasRecord = false, hasDraw = false;
+    std::uint64_t started = 0;
+    std::uint64_t marks[CommitSplitPhaseCount]{};
+    std::uint32_t reached = 0;
+    bool active = false;
     int depth = 0; // Graphics::Draw recurses; only the outermost call measures
     int path = 0;  // 0 = Draw, 1 = DrawWithRecipe
 };
@@ -113,40 +189,30 @@ inline void CommitSplitStart(int path) {
     state.started = CommitSplitNow();
 }
 
-inline void CommitSplitMarkBegin() {
+inline void CommitSplitMark(CommitSplitPhase phase) {
     auto& state = commitSplitState();
-    if (!state.active || state.depth != 1 || state.hasBegin) return;
-    state.markBegin = CommitSplitNow();
-    state.hasBegin = true;
+    if (!state.active || state.depth != 1) return;
+    const auto bit = std::uint32_t{1} << static_cast<std::uint32_t>(phase);
+    if ((state.reached & bit) != 0) return;
+    state.marks[static_cast<std::size_t>(phase)] = CommitSplitNow();
+    state.reached |= bit;
 }
 
-inline void CommitSplitMarkSets() {
-    auto& state = commitSplitState();
-    if (!state.active || state.depth != 1 || state.hasSets) return;
-    state.markSets = CommitSplitNow();
-    state.hasSets = true;
+inline bool CommitSplitReached(const CommitSplitState& state, CommitSplitPhase phase) {
+    return (state.reached & (std::uint32_t{1} << static_cast<std::uint32_t>(phase))) != 0;
 }
 
-inline void CommitSplitMarkLds() {
-    auto& state = commitSplitState();
-    if (!state.active || state.depth != 1 || state.hasLds) return;
-    state.markLds = CommitSplitNow();
-    state.hasLds = true;
+inline std::uint64_t CommitSplitMarkAt(const CommitSplitState& state, CommitSplitPhase phase) {
+    return state.marks[static_cast<std::size_t>(phase)];
 }
 
-inline void CommitSplitMarkRecord() {
-    auto& state = commitSplitState();
-    if (!state.active || state.depth != 1 || state.hasRecord) return;
-    state.markRecord = CommitSplitNow();
-    state.hasRecord = true;
-}
-
-inline void CommitSplitMarkDraw() {
-    auto& state = commitSplitState();
-    if (!state.active || state.depth != 1 || state.hasDraw) return;
-    state.markDraw = CommitSplitNow();
-    state.hasDraw = true;
-}
+// Version 1 keeps its original marks and formulas, so a run stays comparable with
+// the 22.6-23.4 us baseline; it is now expressed with the version 2 mark array.
+inline void CommitSplitMarkBegin() { CommitSplitMark(CommitSplitPhase::PreBegin); }
+inline void CommitSplitMarkSets() { CommitSplitMark(CommitSplitPhase::DescBind); }
+inline void CommitSplitMarkLds() { CommitSplitMark(CommitSplitPhase::LdsBind); }
+inline void CommitSplitMarkRecord() { CommitSplitMark(CommitSplitPhase::Push); }
+inline void CommitSplitMarkDraw() { CommitSplitMark(CommitSplitPhase::Record); }
 
 inline void CommitSplitFinish() {
     if (!CommitSplitEnabled()) return;
@@ -156,37 +222,69 @@ inline void CommitSplitFinish() {
     if (!state.active) return;
     state.active = false;
     const auto end = CommitSplitNow();
-    auto& counters = commitSplitCounters();
     const auto total = end - state.started;
-    if (!state.hasRecord || !state.hasDraw || state.markRecord < state.started || state.markDraw < state.markRecord || end < state.markDraw) {
+    auto& counters = commitSplitCounters();
+    const bool hasBegin = CommitSplitReached(state, CommitSplitPhase::PreBegin);
+    const bool hasSets = CommitSplitReached(state, CommitSplitPhase::DescBind);
+    const bool hasLds = CommitSplitReached(state, CommitSplitPhase::LdsBind);
+    const bool hasRecord = CommitSplitReached(state, CommitSplitPhase::Push);
+    const bool hasDraw = CommitSplitReached(state, CommitSplitPhase::Record);
+
+    // Version 1 line: unchanged formulas, including its own classification rules.
+    if (!hasRecord || !hasDraw || CommitSplitMarkAt(state, CommitSplitPhase::Push) < state.started || CommitSplitMarkAt(state, CommitSplitPhase::Record) < CommitSplitMarkAt(state, CommitSplitPhase::Push) || end < CommitSplitMarkAt(state, CommitSplitPhase::Record)) {
         counters.unclassifiedNs.fetch_add(total, std::memory_order_relaxed);
         counters.unclassified.fetch_add(1, std::memory_order_relaxed);
         if (state.path == 1) counters.recipeUnclassified.fetch_add(1, std::memory_order_relaxed);
-        return;
+    } else {
+        const auto startOfRecord = hasBegin ? CommitSplitMarkAt(state, CommitSplitPhase::PreBegin) : state.started;
+        const auto markSets = CommitSplitMarkAt(state, CommitSplitPhase::DescBind);
+        const auto markLds = CommitSplitMarkAt(state, CommitSplitPhase::LdsBind);
+        const auto markRecord = CommitSplitMarkAt(state, CommitSplitPhase::Push);
+        const auto markDraw = CommitSplitMarkAt(state, CommitSplitPhase::Record);
+        if (!hasBegin) counters.noBegin.fetch_add(1, std::memory_order_relaxed);
+        if (markRecord < startOfRecord || !hasSets || !hasLds || markSets < startOfRecord || markLds < markSets || markRecord < markLds) {
+            counters.unclassifiedNs.fetch_add(total, std::memory_order_relaxed);
+            counters.unclassified.fetch_add(1, std::memory_order_relaxed);
+            if (state.path == 1) counters.recipeUnclassified.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const auto setup = startOfRecord - state.started;
+            const auto begin = markSets - startOfRecord;
+            const auto sets = markLds - markSets;
+            const auto push = markRecord - markLds;
+            const auto record = markDraw - markRecord;
+            const auto finish = end - markDraw;
+            counters.setupNs.fetch_add(setup, std::memory_order_relaxed);
+            counters.beginNs.fetch_add(begin, std::memory_order_relaxed);
+            counters.setsNs.fetch_add(sets, std::memory_order_relaxed);
+            counters.pushNs.fetch_add(push, std::memory_order_relaxed);
+            counters.recordNs.fetch_add(record, std::memory_order_relaxed);
+            counters.finishNs.fetch_add(finish, std::memory_order_relaxed);
+            counters.classifiedNs.fetch_add(total, std::memory_order_relaxed);
+            counters.classified.fetch_add(1, std::memory_order_relaxed);
+            if (state.path == 1) counters.recipeClassified.fetch_add(1, std::memory_order_relaxed);
+            if (setup + begin + sets + push + record + finish > total) counters.violations.fetch_add(1, std::memory_order_relaxed);
+        }
     }
-    const auto startOfRecord = state.hasBegin && state.markBegin >= state.started ? state.markBegin : state.started;
-    if (!state.hasBegin) counters.noBegin.fetch_add(1, std::memory_order_relaxed);
-    if (state.markRecord < startOfRecord || !state.hasSets || !state.hasLds || state.markSets < startOfRecord || state.markLds < state.markSets || state.markRecord < state.markLds) {
-        counters.unclassifiedNs.fetch_add(total, std::memory_order_relaxed);
-        counters.unclassified.fetch_add(1, std::memory_order_relaxed);
-        return;
+
+    // Version 2: forward differences from the last reached mark. The population is
+    // known only here: a reused pass skips every mark of the new-pass block.
+    const std::size_t population = hasSets ? (hasBegin ? 0u : 1u) : 2u;
+    auto& pending = commitSplitPending();
+    ++pending.draws[population];
+    pending.totalNs[population] += total;
+    std::uint64_t previous = state.started;
+    for (std::size_t phase = 0; phase < static_cast<std::size_t>(CommitSplitPhase::Finish); ++phase) {
+        if ((state.reached & (std::uint32_t{1} << phase)) == 0) continue;
+        const auto at = state.marks[phase];
+        if (at > previous) {
+            pending.ns[population][phase] += at - previous;
+            previous = at;
+        }
+        ++pending.count[population][phase];
     }
-    const auto setup = startOfRecord - state.started;
-    const auto begin = state.markSets - startOfRecord;
-    const auto sets = state.markLds - state.markSets;
-    const auto push = state.markRecord - state.markLds;
-    const auto record = state.markDraw - state.markRecord;
-    const auto finish = end - state.markDraw;
-    counters.setupNs.fetch_add(setup, std::memory_order_relaxed);
-    counters.beginNs.fetch_add(begin, std::memory_order_relaxed);
-    counters.setsNs.fetch_add(sets, std::memory_order_relaxed);
-    counters.pushNs.fetch_add(push, std::memory_order_relaxed);
-    counters.recordNs.fetch_add(record, std::memory_order_relaxed);
-    counters.finishNs.fetch_add(finish, std::memory_order_relaxed);
-    counters.classifiedNs.fetch_add(total, std::memory_order_relaxed);
-    counters.classified.fetch_add(1, std::memory_order_relaxed);
-    if (state.path == 1) counters.recipeClassified.fetch_add(1, std::memory_order_relaxed);
-    if (setup + begin + sets + push + record + finish > total) counters.violations.fetch_add(1, std::memory_order_relaxed);
+    if (end > previous) pending.ns[population][static_cast<std::size_t>(CommitSplitPhase::Finish)] += end - previous;
+    ++pending.count[population][static_cast<std::size_t>(CommitSplitPhase::Finish)];
+    if (++pending.drawsPending >= CommitSplitFlushDraws) pending.Flush();
 }
 
 // Scope guard: starts at the entry of Graphics::Draw / DrawWithRecipe and always

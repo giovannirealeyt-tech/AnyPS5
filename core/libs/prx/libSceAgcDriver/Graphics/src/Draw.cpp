@@ -2102,6 +2102,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         countCache(&DrawProfile::uncacheable);
     }
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResLookup);
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
@@ -2112,6 +2113,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (address == AddressStages::ReadOnly && !reuse.has_value()) reuse = resolved.resources->SpaceReuse() ? AddressDrawReuse::Built : AddressDrawReuse::NotSpaceOnly;
     }
     if (reuse.has_value()) countAddressDrawReuse(*reuse);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResBuild);
     timer.phase(PhaseResources);
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
     return resolved;
@@ -2711,6 +2713,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::DescWrites);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2817,6 +2820,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         Graphics::CommitSplitMarkBegin();
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        Graphics::CommitSplitMark(Graphics::CommitSplitPhase::PassBegin);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
@@ -3219,6 +3223,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
     inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, nullptr);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Inputs);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -3354,6 +3359,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (state.depth) {
         targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state)));
     }
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Targets);
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = prepared.recorder = Recorder::Active();
@@ -3574,6 +3580,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Pipeline);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     auto& owners = prepared.owners;
@@ -3598,6 +3605,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
     }
     prepared.depthLocations = passDepthLocations(context, pipelineState, *pipeline);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Framebuffer);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     return true;
@@ -4138,6 +4146,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
     auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, timing, &recipe);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Inputs);
     if (inputs.nothing) {
         result.recorded = true;
         return result;
@@ -4170,6 +4179,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseReadTarget);
         if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Targets);
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
@@ -4192,6 +4202,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResLookup);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();
     outcome.recorded = true;
@@ -4206,6 +4217,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     }
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Pipeline);
+    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Framebuffer);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;

@@ -415,6 +415,29 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
             const auto perDrawUs = [&](std::uint64_t ns) { return static_cast<double>(ns) / 1e3 / static_cast<double>(splitClassified); };
             AgcDriver::ProfilePrint_nid_no_patch("[draw] draw phases (10 s, %llu draw classificati su %llu, %llu non classificati a %.1f us, %llu senza Begin, %llu violation, %llu recipe): setup %.1f us, begin %.1f us, bind set %.1f us, push %.1f us, record %.1f us, finish %.1f us, totale classificato %.1f us, gap %+.1f us (%+.2f%%)\n", static_cast<unsigned long long>(splitClassified), static_cast<unsigned long long>(splitClassified + splitUnclassified), static_cast<unsigned long long>(splitUnclassified), splitUnclassified == 0 ? 0.0 : static_cast<double>(splitUnclassifiedNs) / 1e3 / static_cast<double>(splitUnclassified), static_cast<unsigned long long>(splitNoBegin), static_cast<unsigned long long>(splitViolations), static_cast<unsigned long long>(splitRecipe), perDrawUs(splitSetup), perDrawUs(splitBegin), perDrawUs(splitSets), perDrawUs(splitPush), perDrawUs(splitRecord), perDrawUs(splitFinish), perDrawUs(splitClassifiedNs), static_cast<double>(gap) / 1e3 / static_cast<double>(splitClassified), splitClassifiedNs == 0 ? 0.0 : 100.0 * static_cast<double>(gap) / static_cast<double>(splitClassifiedNs));
         }
+        // Version 2 of the split: one line per population, each phase as the mean over
+        // the draws that reached its mark (n), so a phase of a new pass and one of a
+        // reused pass are never averaged together. A mark that is not reached leaves
+        // its time in the next reached phase; the last one is called "residuo".
+        auto& splitV2 = Graphics::commitSplitV2Counters();
+        static constexpr std::array<const char*, Graphics::CommitSplitPhaseCount> splitV2Names{"inputs", "targets", "resLookup", "resBuild", "pipeline", "framebuffer", "descWrites", "preBegin", "passBegin", "descBind", "ldsBind", "push", "record", "residuo"};
+        for (std::size_t population = 0; population < Graphics::CommitSplitPopulations; ++population) {
+            const auto populationDraws = splitV2.draws[population].exchange(0, std::memory_order_relaxed);
+            const auto populationNs = splitV2.totalNs[population].exchange(0, std::memory_order_relaxed);
+            char phases[768];
+            std::size_t used = 0;
+            for (std::size_t phase = 0; phase < Graphics::CommitSplitPhaseCount; ++phase) {
+                const auto ns = splitV2.ns[population][phase].exchange(0, std::memory_order_relaxed);
+                const auto count = splitV2.count[population][phase].exchange(0, std::memory_order_relaxed);
+                const auto perPhase = count == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(count);
+                const auto written = std::snprintf(phases + used, sizeof(phases) - used, " %s %.1f (n=%llu)", splitV2Names[phase], perPhase, static_cast<unsigned long long>(count));
+                if (written <= 0) break;
+                used += std::min(static_cast<std::size_t>(written), sizeof(phases) - used - 1u);
+            }
+            if (populationDraws != 0) {
+                AgcDriver::ProfilePrint_nid_no_patch("[draw] v2 %s (10 s, %llu draw, %.1f us di commit):%s\n", population == 0 ? "pass nuovo" : population == 1 ? "pass riusato" : "altro", static_cast<unsigned long long>(populationDraws), static_cast<double>(populationNs) / 1e3 / static_cast<double>(populationDraws), phases);
+            }
+        }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
