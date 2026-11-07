@@ -293,6 +293,8 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/BlsLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ShiftLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/BitfieldLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ShaNiLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/SystemInstructionLowering.cpp
     )
     target_include_directories(amd64_only_windows_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include ${CMAKE_CURRENT_SOURCE_DIR}/domain/include ${CMAKE_CURRENT_SOURCE_DIR}/io/include ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libc/src/specifics/windows)
     if(BUILD_TESTING)
@@ -541,6 +543,7 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/EntryStubBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/ProgramHeaderLayoutBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/SectionHeaderTableBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/TrampolineWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/StubBodyBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/DecodedInstruction.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
@@ -586,11 +589,14 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/BlsLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ShiftLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/BitfieldLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ShaNiLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/SystemInstructionLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/SegmentFilter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/EntryStubBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/ProgramHeaderLayoutBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/SectionHeaderTableBuilder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/TrampolineWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libs/nid/src/NidCompute.cpp

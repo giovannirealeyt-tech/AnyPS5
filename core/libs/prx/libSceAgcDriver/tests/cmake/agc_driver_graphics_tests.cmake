@@ -41,6 +41,7 @@ target_include_directories(agc_driver_graphics_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
         ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/3rdparty/freesper
 )
 
 target_link_libraries(agc_driver_graphics_tests PRIVATE
