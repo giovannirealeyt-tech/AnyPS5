@@ -1896,7 +1896,6 @@ int APS5_VABI sceSaveDataCreateUploadData(void) {
 }
 
 int APS5_VABI sceSaveDataDebugGetThreadId(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
@@ -1971,7 +1970,6 @@ int APS5_VABI sceSaveDataGetBoundPsnAccountCount(void) {
 }
 
 int APS5_VABI sceSaveDataGetClientThreadPriority(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
@@ -1985,7 +1983,9 @@ int APS5_VABI sceSaveDataGetEventInfo() {
     return 0;
 }
 
-int APS5_VABI sceSaveDataGetMountedSaveDataCount() {
+int APS5_VABI sceSaveDataGetMountedSaveDataCount(std::int32_t reserved, std::uint32_t* count) {
+    (void)reserved;
+    (void)count;
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -2016,8 +2016,7 @@ int APS5_VABI sceSaveDataGetSaveDataRootUsbPath(void) {
 }
 
 int APS5_VABI sceSaveDataGetSavePoint(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return 2;
 }
 
 int APS5_VABI sceSaveDataGetUpdatedDataCount(void) {
