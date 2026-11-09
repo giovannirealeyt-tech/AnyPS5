@@ -253,7 +253,7 @@ static bool diagBuildSeen[PAD_MAX_CONTROLLERS] = {};
 static std::uint32_t diagBuildCount[PAD_MAX_CONTROLLERS] = {};
 static std::uint32_t diagLastScripted[PAD_MAX_CONTROLLERS] = {};
 
-PadData BuildData(PadSlot& slot, const PadInputState& state, std::uint64_t changeTime, std::uint64_t now, const Pad::InputCommandFile::Input& injected, int port) {
+PadData BuildData(PadSlot& slot, const PadInputState& state, std::uint64_t changeTime, std::uint64_t fuseTime, std::uint64_t now, const Pad::InputCommandFile::Input& injected, int port) {
     PadData data{};
     const bool intercepted = state.intercepted;
     const std::uint32_t scripted = port == 0 ? scriptedButtons(now) : 0u;
@@ -291,14 +291,14 @@ PadData BuildData(PadSlot& slot, const PadInputState& state, std::uint64_t chang
         }
     }
     if (live) {
-        float dt = slot.lastFuseTime != 0 && now > slot.lastFuseTime ? static_cast<float>(now - slot.lastFuseTime) * 1e-6f : 0.0f;
+        float dt = slot.lastFuseTime != 0 && fuseTime > slot.lastFuseTime ? static_cast<float>(fuseTime - slot.lastFuseTime) * 1e-6f : 0.0f;
         dt = std::min(dt, 0.1f);
         fuse(slot, dt, accel, gyro);
     } else {
         slot.orientation = Quat{};
         slot.biasIntegral[0] = slot.biasIntegral[1] = slot.biasIntegral[2] = 0.0f;
     }
-    slot.lastFuseTime = now;
+    slot.lastFuseTime = std::max(slot.lastFuseTime, fuseTime);
     data.orientation_x = slot.orientation.x;
     data.orientation_y = slot.orientation.y;
     data.orientation_z = slot.orientation.z;
@@ -427,7 +427,7 @@ PadData Pad::ReadState(int port) {
         const std::uint32_t scriptedNow = port == 0 ? scriptedButtons(now) : 0u;
         PadDiagLog("[pad-diag] ReadState first port=%d now_us=%llu initialized=%d withdrawn=%d scripted_now=0x%08x\n", port, static_cast<unsigned long long>(now), initialized, withdrawn, scriptedNow);
     }
-    PadData data = withdrawn ? WithdrawnData(slot.timestamp) : BuildData(slot, slot.state, slot.timestamp, now, injected, port);
+    PadData data = withdrawn ? WithdrawnData(slot.timestamp) : BuildData(slot, slot.state, now, now, now, injected, port);
     if (!withdrawn && slot.pressedSinceRead != 0 && now - slot.pressedAt <= LatchExpiry(slot)) {
         data.buttons |= slot.pressedSinceRead;
         if (slot.pressedSinceRead & 0x100u) data.analog_buttons_l2 = std::max(data.analog_buttons_l2, slot.pressedAnalogL2);
@@ -486,7 +486,7 @@ int Pad::Read(PadData* data, int num, int port) {
         return 1;
     }
     if (slot.queue.empty()) {
-        data[0] = BuildData(slot, slot.state, slot.timestamp, now, injected, port);
+        data[0] = BuildData(slot, slot.state, now, now, now, injected, port);
         if (PadDiag()) {
             const std::uint32_t scriptedNowRet = port == 0 ? scriptedButtons(now) : 0u;
             PadDiagLog("[pad-ret] func=Read port=%d now_us=%llu ret_count=1 ret_code=0 timestamp=%llu connected=%d withdrawn=0 intercepted=%d scripted_win_hasbit=%d buttons_has_scriptbit=%d\n",
@@ -499,7 +499,8 @@ int Pad::Read(PadData* data, int num, int port) {
     int count = 0;
     while (count < num && !slot.queue.empty()) {
         const QueuedInput& entry = slot.queue.front();
-        data[count++] = BuildData(slot, entry.input, port == 0 ? std::max(entry.timestamp, injectedTimestamp) : entry.timestamp, now, injected, port);
+        const std::uint64_t sample = port == 0 ? std::max(entry.timestamp, injectedTimestamp) : entry.timestamp;
+        data[count++] = BuildData(slot, entry.input, sample, sample, now, injected, port);
         slot.queue.pop_front();
     }
     if (PadDiag() && count > 0) {

@@ -9,11 +9,13 @@
 #include "prx/libkernel/File/include/HostStreams.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -250,9 +252,8 @@ static KernelEqueueEvent FileEvent(int descriptor, int16_t filter, uint16_t flag
     return event;
 }
 
-static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
 static std::mutex g_equeueMutex;
-static uint64_t g_nextEqueue = 1;
+static std::uint32_t g_nextEqueueId = 1;
 
 struct KernelEqueuePrivate::WaitSet {
     std::vector<GuestSockets::Interest> interests;
@@ -845,12 +846,11 @@ void KernelEqueuePrivate::WakeReadWaiters(uintptr_t ident) {
 }
 
 KernelEqueueRef EqueuePin_nid_postfix(KernelEqueue eq) {
-    if (eq == 0) {
+    const auto descriptor = static_cast<std::uint32_t>(eq);
+    if (descriptor == 0 || descriptor > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
         return {};
     }
-    std::unique_lock lock(g_equeueMutex);
-    auto it = g_equeues.find(eq);
-    return it != g_equeues.end() ? it->second : KernelEqueueRef{};
+    return FindKqueueDescriptor(static_cast<int>(descriptor));
 }
 
 int APS5_VABI EqueueAddEvent_nid_postfix(KernelEqueue eq, const KernelEqueueEvent& event) {
@@ -882,31 +882,31 @@ int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
     std::unique_lock lock(g_equeueMutex);
-    if (g_nextEqueue > static_cast<uint64_t>(std::numeric_limits<KernelEqueue>::max())) {
+    if (g_nextEqueueId > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::runtime_error("equeue handle space exhausted");
     }
-    *eq = static_cast<KernelEqueue>(g_nextEqueue++);
-    auto owner = std::make_shared<KernelEqueuePrivate>(*eq);
+    const int descriptor = ReserveKqueueDescriptor();
+    if (descriptor < 0) {
+        if (errno == EMFILE) return SCE_KERNEL_ERROR_EMFILE;
+        if (errno == ENFILE) return SCE_KERNEL_ERROR_ENFILE;
+        throw std::runtime_error("sceKernelCreateEqueue: reserving a descriptor failed, errno=" + std::to_string(errno));
+    }
+    const auto handle = static_cast<KernelEqueue>((static_cast<std::uint64_t>(g_nextEqueueId++) << 32) | static_cast<std::uint32_t>(descriptor));
+    auto owner = std::make_shared<KernelEqueuePrivate>(handle);
     owner->SetName(std::string(name));
-    IdentityAttach(*eq, name);
-    g_equeues.emplace(*eq, std::move(owner));
+    IdentityAttach(handle, name);
+    RegisterKqueueDescriptor(descriptor, std::move(owner));
+    *eq = handle;
     return EQUEUE_OK;
 }
 
 int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq) {
-    KernelEqueueRef owner;
-    {
-        std::unique_lock lock(g_equeueMutex);
-        auto it = g_equeues.find(eq);
-        if (it == g_equeues.end()) {
-            return SCE_KERNEL_ERROR_EBADF;
-        }
-        owner = std::move(it->second);
-        g_equeues.erase(it);
+    const auto owner = EqueuePin_nid_postfix(eq);
+    if (!owner || owner->Handle() != eq) {
+        return SCE_KERNEL_ERROR_EBADF;
     }
     IdentityDetach(eq);
-    owner->Close();
-    return EQUEUE_OK;
+    return sceKernelClose(static_cast<int>(static_cast<std::uint32_t>(eq)));
 }
 
 int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out, const KernelUseconds* timo) {
@@ -1068,9 +1068,6 @@ int APS5_VABI sceKernelDeleteTimerEvent(KernelEqueue eq, int id) {
 }
 
 int APS5_VABI sceKernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
-    if (eq == 0) {
-        return EQUEUE_OK;
-    }
     KernelEqueueEvent event{};
     event.event.ident = static_cast<uintptr_t>(id);
     event.event.filter = EVFILT_AMPR;
@@ -1093,9 +1090,7 @@ int APS5_VABI sceKernelAddAmprEvent(KernelEqueue eq, int id, void* udata) {
             e->event.data = 0;
         }
     };
-    EqueueAddEvent_nid_postfix(eq, event);
-
-    return EQUEUE_OK;
+    return EqueueAddEvent_nid_postfix(eq, event);
 }
 
 int APS5_VABI sceKernelAddAmprSystemEvent(KernelEqueue eq, int id, void* udata) {
@@ -1212,28 +1207,8 @@ static void NotifyDescriptorCloseObservers(int descriptor) {
 void EqueueDescriptorClosed(int descriptor) {
     KqueueDescriptorClosed(descriptor);
     NotifyDescriptorCloseObservers(descriptor);
-    std::vector<KernelEqueueRef> owners;
-    {
-        std::unique_lock lock(g_equeueMutex);
-        for (const auto& [handle, owner] : g_equeues) {
-            owners.push_back(owner);
-        }
-    }
-    for (const auto& owner : owners) {
-        owner->RemoveDescriptorEvents(static_cast<uintptr_t>(descriptor));
-    }
 }
 
 void EqueueDescriptorReadShut(int descriptor) {
     KqueueDescriptorReadShut(descriptor);
-    std::vector<KernelEqueueRef> owners;
-    {
-        std::unique_lock lock(g_equeueMutex);
-        for (const auto& [handle, owner] : g_equeues) {
-            owners.push_back(owner);
-        }
-    }
-    for (const auto& owner : owners) {
-        owner->WakeReadWaiters(static_cast<uintptr_t>(descriptor));
-    }
 }

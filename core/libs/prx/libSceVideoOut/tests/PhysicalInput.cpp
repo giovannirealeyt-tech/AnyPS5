@@ -4,6 +4,7 @@
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceMouse/include/MouseState.hpp"
 #include "prx/libSceKeyboard/include/KeyboardState.hpp"
+#include "prx/libSceUserService/UserService.hpp"
 #include "SDL.h"
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +17,7 @@ static void Require(bool condition, const char* reason) {
 int main() {
     Require(std::getenv("APS5_NO_PHYSICAL_INPUT") != nullptr, "gate must be enabled before startup");
     Require(Keyboard::Initialize() == KEYBOARD_OK, "keyboard init");
-    Require(Keyboard::Open(1, 0, 0) == KEYBOARD_HANDLE, "keyboard open");
+    Require(Keyboard::Open(USER_SERVICE_INITIAL_USER_ID, 0, 0) == KEYBOARD_HANDLE, "keyboard open");
     Require(Mouse::Initialize() == MOUSE_OK, "mouse init");
     Require(Mouse::Open(1, 0, 0, nullptr) == MOUSE_HANDLE, "mouse open");
     Pad::Initialize();
