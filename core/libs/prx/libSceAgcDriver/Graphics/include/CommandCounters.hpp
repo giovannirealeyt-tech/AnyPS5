@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 
 namespace AgcDriver::Graphics {
 
@@ -295,6 +296,116 @@ struct CommitSplitScope {
     CommitSplitScope(const CommitSplitScope&) = delete;
     CommitSplitScope& operator=(const CommitSplitScope&) = delete;
 };
+
+enum MovedSizeBucket : std::size_t {
+    MovedSize0 = 0, MovedSize1, MovedSize2to4, MovedSize5to8, MovedSize9to16, MovedSize17to32, MovedSize33plus, MovedSizeBucketCount
+};
+
+inline std::size_t MovedSizeBucketOf(std::size_t size) {
+    if (size == 0) return MovedSize0;
+    if (size == 1) return MovedSize1;
+    if (size <= 4) return MovedSize2to4;
+    if (size <= 8) return MovedSize5to8;
+    if (size <= 16) return MovedSize9to16;
+    if (size <= 32) return MovedSize17to32;
+    return MovedSize33plus;
+}
+
+inline bool MovedStatsEnabled() {
+    static const bool enabled = std::getenv("APS5_MOVED_STATS") != nullptr;
+    return enabled;
+}
+
+inline bool MovedStatsReportEnabled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return profile || stats || MovedStatsEnabled();
+}
+
+struct MovedStatsAggregate {
+    std::uint64_t calls = 0, earlyExit = 0, loopCalls = 0, movedEmpty = 0, movedNonEmpty = 0, comparisons = 0;
+    std::uint64_t allocations[MovedSizeBucketCount]{}, moved[MovedSizeBucketCount]{};
+    std::uint64_t maxAllocations = 0, maxMoved = 0;
+};
+
+struct MovedStatsState {
+    std::mutex mutex;
+    MovedStatsAggregate aggregate;
+};
+
+inline MovedStatsState& movedStatsState() {
+    static MovedStatsState state;
+    return state;
+}
+
+inline void PublishMovedStats(const MovedStatsAggregate& batch) {
+    auto& state = movedStatsState();
+    std::lock_guard lock(state.mutex);
+    auto& aggregate = state.aggregate;
+    aggregate.calls += batch.calls;
+    aggregate.earlyExit += batch.earlyExit;
+    aggregate.loopCalls += batch.loopCalls;
+    aggregate.movedEmpty += batch.movedEmpty;
+    aggregate.movedNonEmpty += batch.movedNonEmpty;
+    aggregate.comparisons += batch.comparisons;
+    for (std::size_t bucket = 0; bucket < MovedSizeBucketCount; ++bucket) {
+        aggregate.allocations[bucket] += batch.allocations[bucket];
+        aggregate.moved[bucket] += batch.moved[bucket];
+    }
+    if (batch.maxAllocations > aggregate.maxAllocations) aggregate.maxAllocations = batch.maxAllocations;
+    if (batch.maxMoved > aggregate.maxMoved) aggregate.maxMoved = batch.maxMoved;
+}
+
+inline MovedStatsAggregate TakeMovedStats() {
+    auto& state = movedStatsState();
+    std::lock_guard lock(state.mutex);
+    const auto taken = state.aggregate;
+    state.aggregate = MovedStatsAggregate{};
+    return taken;
+}
+
+inline void ResetMovedStats() {
+    auto& state = movedStatsState();
+    std::lock_guard lock(state.mutex);
+    state.aggregate = MovedStatsAggregate{};
+}
+
+inline constexpr std::uint32_t MovedStatsFlushCalls = 64;
+
+struct MovedStatsPending {
+    MovedStatsAggregate batch;
+    std::uint32_t pending = 0;
+    void Flush();
+};
+
+inline MovedStatsPending& movedStatsPending() {
+    static thread_local MovedStatsPending pending;
+    return pending;
+}
+
+inline void MovedStatsPending::Flush() {
+    PublishMovedStats(batch);
+    batch = MovedStatsAggregate{};
+    pending = 0;
+}
+
+inline void RecordMovedStats(bool earlyExit, std::size_t allocationsSize, std::size_t movedSize, std::size_t comparisons) {
+    auto& pending = movedStatsPending();
+    auto& batch = pending.batch;
+    ++batch.calls;
+    batch.comparisons += comparisons;
+    if (earlyExit) {
+        ++batch.earlyExit;
+    } else {
+        ++batch.loopCalls;
+        ++(movedSize == 0 ? batch.movedEmpty : batch.movedNonEmpty);
+        ++batch.allocations[MovedSizeBucketOf(allocationsSize)];
+        ++batch.moved[MovedSizeBucketOf(movedSize)];
+        if (allocationsSize > batch.maxAllocations) batch.maxAllocations = allocationsSize;
+        if (movedSize > batch.maxMoved) batch.maxMoved = movedSize;
+    }
+    if (++pending.pending >= MovedStatsFlushCalls) pending.Flush();
+}
 
 // Last bind state per recording thread and command buffer. Bindings persist only
 // inside a command buffer, so a different command buffer invalidates everything.

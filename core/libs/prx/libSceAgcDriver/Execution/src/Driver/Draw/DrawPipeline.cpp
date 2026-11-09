@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResLookupProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -380,8 +381,7 @@ void DrawPipeline::enqueue(Item item) {
         ++wakes;
         wake.notify_one();
     }
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats) return;
+    if (!Graphics::MovedStatsReportEnabled() && !Graphics::ResLookupSplitEnabled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
@@ -467,6 +467,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
             }
             if (populationDraws != 0) {
                 AgcDriver::ProfilePrint_nid_no_patch("[draw] v2 %s (10 s, %llu draw, %.1f us di commit):%s\n", population == 0 ? "pass nuovo" : population == 1 ? "pass riusato" : "altro", static_cast<unsigned long long>(populationDraws), static_cast<double>(populationNs) / 1e3 / static_cast<double>(populationDraws), phases);
+            }
+        }
+        if (Graphics::MovedStatsEnabled()) {
+            const auto movedStats = Graphics::TakeMovedStats();
+            if (movedStats.calls != 0) {
+                AgcDriver::ProfilePrint_nid_no_patch("[draw] moved stats (10 s): %llu calls, %llu early exit before the loop, %llu reached the loop (%llu moved empty, %llu moved non-empty), find_if comparisons %llu; allocations 0:%llu 1:%llu 2-4:%llu 5-8:%llu 9-16:%llu 17-32:%llu 33+:%llu max %llu; moved 0:%llu 1:%llu 2-4:%llu 5-8:%llu 9-16:%llu 17-32:%llu 33+:%llu max %llu\n", static_cast<unsigned long long>(movedStats.calls), static_cast<unsigned long long>(movedStats.earlyExit), static_cast<unsigned long long>(movedStats.loopCalls), static_cast<unsigned long long>(movedStats.movedEmpty), static_cast<unsigned long long>(movedStats.movedNonEmpty), static_cast<unsigned long long>(movedStats.comparisons), static_cast<unsigned long long>(movedStats.allocations[0]), static_cast<unsigned long long>(movedStats.allocations[1]), static_cast<unsigned long long>(movedStats.allocations[2]), static_cast<unsigned long long>(movedStats.allocations[3]), static_cast<unsigned long long>(movedStats.allocations[4]), static_cast<unsigned long long>(movedStats.allocations[5]), static_cast<unsigned long long>(movedStats.allocations[6]), static_cast<unsigned long long>(movedStats.maxAllocations), static_cast<unsigned long long>(movedStats.moved[0]), static_cast<unsigned long long>(movedStats.moved[1]), static_cast<unsigned long long>(movedStats.moved[2]), static_cast<unsigned long long>(movedStats.moved[3]), static_cast<unsigned long long>(movedStats.moved[4]), static_cast<unsigned long long>(movedStats.moved[5]), static_cast<unsigned long long>(movedStats.moved[6]), static_cast<unsigned long long>(movedStats.maxMoved));
             }
         }
     }

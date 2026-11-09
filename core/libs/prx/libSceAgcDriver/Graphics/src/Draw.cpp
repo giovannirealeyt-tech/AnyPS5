@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResLookupProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -46,6 +47,7 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -2112,7 +2114,72 @@ bool drawStagingEnabled() {
     return !disabled;
 }
 
+template <typename F>
+auto resLookupTimed(ResLookupSample& sample, ResLookupSpan span, F&& fn) {
+    if (!sample.active) return fn();
+    const auto before = ResLookupNow();
+    if constexpr (std::is_void_v<std::invoke_result_t<F>>) {
+        fn();
+        sample.Span(span, before, ResLookupNow());
+    } else {
+        auto result = fn();
+        sample.Span(span, before, ResLookupNow());
+        return result;
+    }
+}
+
+void maybeReportResLookupSplit() {
+    static std::atomic<std::uint64_t> lastNs{0};
+    const auto now = ResLookupNow();
+    auto last = lastNs.load(std::memory_order_relaxed);
+    if (now - last < 10000000000ull) return;
+    if (!lastNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto aggregate = TakeResLookupAggregate();
+    if (aggregate.calls == 0) return;
+    static constexpr std::array<const char*, ResLookupClassCount> classNames{"uncacheable", "findMiss", "fallback", "invalidated", "accepted", "unclassified"};
+    static constexpr std::array<const char*, ResLookupSpanCount> spanNames{"key", "find", "spaceRevalidate", "moved", "alias"};
+    AgcDriver::ProfilePrint_nid_no_patch("[reslookup] %llu resolveDrawResources calls (wall ns, leaf-lock waits included; TLS batches of %u, up to %u records per thread lost at exit):\n", static_cast<unsigned long long>(aggregate.calls), ResLookupFlushRecords, ResLookupFlushRecords - 1);
+    for (std::size_t c = 0; c < ResLookupClassCount; ++c) {
+        if (aggregate.classCount[c] == 0) continue;
+        char line[768];
+        int n = std::snprintf(line, sizeof(line), "[reslookup]   %s: calls %llu, total %llu ns", classNames[c], static_cast<unsigned long long>(aggregate.classCount[c]), static_cast<unsigned long long>(aggregate.classTotalNs[c]));
+        for (std::size_t s = 0; s < ResLookupSpanCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++s) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ", %s %llu ns / %llu calls", spanNames[s], static_cast<unsigned long long>(aggregate.spanNs[c][s]), static_cast<unsigned long long>(aggregate.spanCalls[c][s]));
+        }
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ", resid %+lld ns", static_cast<long long>(ResLookupResidualNs(aggregate, static_cast<ResLookupClass>(c))));
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    }
+    if (aggregate.shapeErrors != 0) AgcDriver::ProfilePrint_nid_no_patch("[reslookup]   shape errors: %llu\n", static_cast<unsigned long long>(aggregate.shapeErrors));
+    if (aggregate.clockViolations != 0) AgcDriver::ProfilePrint_nid_no_patch("[reslookup]   clock violations: %llu\n", static_cast<unsigned long long>(aggregate.clockViolations));
+    if (SpaceSplitEnabled()) {
+        static constexpr std::array<const char*, SpacePhaseCount> phaseNames{"initial", "completion", "firstFast", "decision", "refresh", "retry", "audit", "walk", "diagnosticWalk", "buffer", "bookkeeping"};
+        static constexpr std::array<const char*, SpaceOutcomeCount> outcomeNames{"notInvoked", "notReached", "skippedSpaceHeld", "rejectImageViews", "rejectNotReusable", "epochHit", "epochDiagnosticHit", "epochDiagnosticFailure", "fastHit", "ownRefreshedHit", "fullWalkHit", "walkFailure", "bufferFailure"};
+        AgcDriver::ProfilePrint_nid_no_patch("[resspace] enabled %llu invoked %llu success %llu clock %llu incoherent %llu (wall ns, phase waits included; TLS, up to 63 records per thread lost at exit):\n", static_cast<unsigned long long>(aggregate.space.enabled), static_cast<unsigned long long>(aggregate.space.invoked), static_cast<unsigned long long>(aggregate.space.success), static_cast<unsigned long long>(aggregate.space.clockViolations), static_cast<unsigned long long>(aggregate.space.incoherent));
+        for (std::size_t c = 0; c < ResLookupClassCount; ++c) {
+            if (aggregate.space.outcome[c][0] == 0 && aggregate.space.spanNs[c] == 0) {
+                bool any = false;
+                for (std::size_t o = 1; o < SpaceOutcomeCount; ++o) if (aggregate.space.outcome[c][o] != 0) any = true;
+                if (!any) continue;
+            }
+            char line[1024];
+            int n = std::snprintf(line, sizeof(line), "[resspace]   %s: outcomes", classNames[c]);
+            for (std::size_t o = 0; o < SpaceOutcomeCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++o) {
+                if (aggregate.space.outcome[c][o] == 0) continue;
+                n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%llu", outcomeNames[o], static_cast<unsigned long long>(aggregate.space.outcome[c][o]));
+            }
+            if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; span %llu ns, resid %+lld ns", static_cast<unsigned long long>(aggregate.space.spanNs[c]), static_cast<long long>(aggregate.space.residualNs[c]));
+            for (std::size_t p = 0; p < SpacePhaseCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++p) {
+                n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; %s %llu ns / %llu", phaseNames[p], static_cast<unsigned long long>(aggregate.space.phaseNs[c][p]), static_cast<unsigned long long>(aggregate.space.phaseCalls[c][p]));
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+        }
+    }
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer) {
+    const bool resLookupEnabled = ResLookupSplitEnabled();
+    ResLookupSample resLookup(resLookupEnabled);
+    resLookup.Begin();
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2131,8 +2198,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
-        resolved.contentKey = plan.contentKey;
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        resLookup.NoteCacheable();
+        resolved.contentKey = resLookupTimed(resLookup, ResLookupSpan::Key, [&] {
+            return plan.contentKey;
+        });
+        auto cached = resLookupTimed(resLookup, ResLookupSpan::Find, [&] { return SharedResourceCache().Find(resolved.contentKey); });
+        resLookup.NoteFindHit(cached != nullptr);
+        if (cached) {
+            resLookup.SpanBegin();
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2164,14 +2237,22 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
+            SpaceData spaceData;
+            SpaceProbeScope spaceScope(&spaceData);
+            SpaceInvocationGuard spaceInvocation;
             const bool valid = spaceHeld && cached->Revalidate(shaders);
+            if (!spaceHeld) SpaceSetSkipped(SpaceOutcome::SkippedSpaceHeld);
+            spaceScope.Finalize();
+            resLookup.record.space = spaceData;
+            resLookup.SpanEnd(ResLookupSpan::SpaceRevalidate);
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+            if (valid && recorder != nullptr) moved = resLookupTimed(resLookup, ResLookupSpan::Moved, [&] { return cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched); });
             if (moved.has_value()) {
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                resLookup.Note(ResLookupClass::Accepted);
+                if (trimKey) resLookupTimed(resLookup, ResLookupSpan::Alias, [&] { CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes); });
                 if (counted && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, snapshots, indexBytes, *cached);
                 static_cast<void>(heldSpace.release());
                 resolved.resources = std::move(cached);
@@ -2180,10 +2261,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
+                resLookup.Note(ResLookupClass::Fallback);
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                resLookup.Note(ResLookupClass::Invalidated);
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
@@ -2192,6 +2275,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         countCache(&DrawProfile::uncacheable);
     }
+    resLookup.Finish();
+    if (resLookupEnabled) maybeReportResLookupSplit();
     Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResLookup);
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {

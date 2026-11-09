@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResLookupProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -3877,29 +3878,52 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    SpaceMark(SpacePhase::Initial);
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
+        SpaceEndPhase();
+        SpaceSetOutcome(false, SpacePath::NotInvoked, SpaceOutcome::RejectImageViews);
         return false;
     }
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
+        SpaceEndPhase();
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
-            if (verify && ++reuses % 64u == 0u) {
-                const bool ok = revalidateFull(shaders, report);
+            SpaceMark(SpacePhase::Decision);
+            const bool diagnostic = verify && ++reuses % 64u == 0u;
+            SpaceEndPhase();
+            if (diagnostic) {
+                SpaceSetEpochDiagnostic(true);
+                SpaceMark(SpacePhase::DiagnosticWalk);
+                bool ok;
+                {
+                    SpaceNestedGuard nested;
+                    ok = revalidateFull(shaders, report);
+                }
+                SpaceEndPhase();
+                SpaceResetOutcome();
+                SpaceSetOutcomeFinal(ok, SpacePath::Epoch, ok ? SpaceOutcome::EpochDiagnosticHit : SpaceOutcome::EpochDiagnosticFailure);
+                SpaceMark(SpacePhase::Bookkeeping);
                 noteEpochProof(true, true, !ok);
+                SpaceEndPhase();
                 return ok;
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+            SpaceMark(SpacePhase::Bookkeeping);
             noteEpochProof(true, false, false);
+            SpaceEndPhase();
+            SpaceSetOutcome(true, SpacePath::Epoch, SpaceOutcome::EpochHit);
             return true;
         }
         const bool ok = revalidateFull(shaders, report);
+        SpaceMark(SpacePhase::Bookkeeping);
         noteEpochProof(false, false, false);
+        SpaceEndPhase();
         if (ok) {
             provedEpoch = epoch;
             provedProof = proof;
@@ -3914,9 +3938,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
-    if (!reusable || shaders.empty()) return false;
+    if (!reusable || shaders.empty()) {
+        SpaceSetOutcome(false, SpacePath::NotInvoked, SpaceOutcome::RejectNotReusable);
+        return false;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    SpaceMark(SpacePhase::Completion);
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -3930,11 +3958,17 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    SpaceEndPhase();
+    SpaceMark(SpacePhase::Bookkeeping);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
-    const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+    bool ownRefreshed = false;
+    const auto finish = [&](bool fast, bool ok, SpaceOutcome outcome, ProofFailure failure = ProofFailure::Other) {
+        SpaceEndPhase();
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
+        const auto path = !fast ? SpacePath::FullWalk : ownRefreshed ? SpacePath::OwnRefreshed : SpacePath::Fast;
+        SpaceSetOutcomeFinal(ok, path, outcome);
         return ok;
     };
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
@@ -4044,40 +4078,52 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
+    SpaceMark(SpacePhase::FirstFast);
     bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    SpaceEndPhase();
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
     // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
     // takes the full walk as before.
-    bool ownRefreshed = false;
     if (!fast && !overlapping.empty()) {
         auto fallback = OwnRefreshFallback::Count;
+        SpaceMark(SpacePhase::Refresh);
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
         else {
             refreshed = overlapping;
             fallback = refreshOwnObjects(shaders, refreshed);
         }
+        SpaceEndPhase();
         if (fallback == OwnRefreshFallback::Count) {
+            SpaceMark(SpacePhase::Retry);
             fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+            SpaceEndPhase();
             if (fast) ownRefreshed = true;
             else fallback = OwnRefreshFallback::Rerun;
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
     if (fast && TemplateAuditDue(lastFullWalk) && (AuditEveryInterval() || (walkImportGeneration != HostImportSetGeneration() && ImportAuditAdmitted()))) {
+        SpaceMark(SpacePhase::Audit);
         fast = false;
         ownRefreshed = false;
         reason = FastFail::Audit;
+        SpaceEndPhase();
     }
+    SpaceMark(SpacePhase::Bookkeeping);
     if (report != nullptr) {
         report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
         report->audited = !fast && reason == FastFail::Audit;
     }
+    SpaceEndPhase();
     if (!fast) {
         countFullWalk(reason);
+        SpaceMark(SpacePhase::Walk);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool walked = fullWalk();
+        SpaceEndPhase();
+        SpaceSetWalkAttempted(walked);
         countFullWalkTime(reason, walkStart);
         if (!walked) {
             const auto failure = [&] {
@@ -4089,7 +4135,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     default: return ProofFailure::Other;
                 }
             }();
-            return finish(false, false, failure);
+            return finish(false, false, SpaceOutcome::WalkFailure, failure);
         }
     } else if (ownRefreshed || accepted) {
         if (profile && ownRefreshed) Revalidations().ownRefreshed.fetch_add(1, std::memory_order_relaxed);
@@ -4104,7 +4150,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
             }
             for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+            SpaceMark(SpacePhase::DiagnosticWalk);
             const bool same = fullWalk();
+            SpaceEndPhase();
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (!same || moved != versions.end()) {
                 std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
@@ -4114,6 +4162,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    SpaceMark(SpacePhase::Buffer);
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports
@@ -4150,31 +4199,31 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
         } else {
-            if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
+            if (!serialLoop()) return finish(fast, false, SpaceOutcome::BufferFailure, ProofFailure::Imports);
             importsProof = HostImportsIdentity(context);
         }
     } else {
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
-        if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
+        if (!serialLoop()) return finish(fast, false, SpaceOutcome::BufferFailure, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
-    if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed);
+    if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, SpaceOutcome::BufferFailure, ProofFailure::Changed);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
-            return finish(fast, false);
+            return finish(fast, false, SpaceOutcome::BufferFailure);
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }
-    return finish(fast, true);
+    return finish(fast, true, !fast ? SpaceOutcome::FullWalkHit : ownRefreshed ? SpaceOutcome::OwnRefreshedHit : SpaceOutcome::FastHit);
 }
 
 namespace {
@@ -6330,8 +6379,13 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
-    requireGuestBuffers(moved);
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
+    const bool movedStats = Graphics::MovedStatsEnabled();
+    std::size_t movedComparisons = 0;
+    requireGuestBuffers(moved, movedStats ? &movedComparisons : nullptr);
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) {
+        if (movedStats) Graphics::RecordMovedStats(true, 0, moved.size(), movedComparisons);
+        return {};
+    }
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -6352,6 +6406,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (movedStats) movedComparisons += static_cast<std::size_t>(override - moved.begin()) + (override != moved.end() ? 1u : 0u);
         if (override != moved.end() && !override->words.empty()) {
             auto slice = recorder.DrawUpload(override->size);
             std::memcpy(slice.bytes, override->words.data(), override->size);
@@ -6416,6 +6471,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    if (movedStats) Graphics::RecordMovedStats(false, allocations.size(), moved.size(), movedComparisons);
     if (selected.empty()) return {};
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
@@ -6546,11 +6602,12 @@ void ShaderResources::prepareFaultSlot() const {
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved, std::size_t* comparisons) const {
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (comparisons != nullptr) *comparisons += static_cast<std::size_t>(override - moved.begin()) + (override != moved.end() ? 1u : 0u);
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
         RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
