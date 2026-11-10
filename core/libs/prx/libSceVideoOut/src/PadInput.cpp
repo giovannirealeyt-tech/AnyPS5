@@ -12,6 +12,7 @@
 
 #include "SDL.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
+#include "prx/libSceVideoOut/include/PhysicalInput.hpp"
 #include "prx/libSceVideoOut/include/DualSenseStatus.hpp"
 #include "prx/libScePad/include/PadTriggerEffect.hpp"
 #include "prx/libSceVideoOut/include/PadStatusSdl.hpp"
@@ -56,6 +57,7 @@ PadInput::PadInput(Pad::InputConfiguration configuration) : keyboardMouse(std::m
     openAvailableControllers();
     port0 = Port0Presence::Presence(port0Mode, slots[0].controller != nullptr);
     if (port0Mode == Port0Presence::Mode::Controller) applyPort0(port0.Connected());
+    if (PhysicalInputDisabled()) PadPublishInput_nid_postfix(PadInputState{});
 }
 
 PadInput::~PadInput() {
@@ -65,6 +67,7 @@ PadInput::~PadInput() {
 }
 
 void PadInput::openAvailableControllers() {
+    if (PhysicalInputDisabled()) return;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
     if ((SDL_WasInit(SDL_INIT_GAMECONTROLLER) & SDL_INIT_GAMECONTROLLER) == 0) {
@@ -430,6 +433,7 @@ PadInputState PadInput::sampleController(int slot) const {
 }
 
 void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
+    if (PhysicalInputDisabled() && event.type != SDL_WINDOWEVENT) return;
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
         openController(event.cdevice.which);
         return;

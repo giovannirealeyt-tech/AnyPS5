@@ -25,6 +25,7 @@ int main() {
     stale.buttons = 0x8000;
     stale.sticks[0] = 0;
     PadPublishInput_nid_postfix(stale);
+    static_cast<void>(Pad::ReadState());
     PadInput pad;
     MouseInput mouse;
     KeyboardInput keyboard;

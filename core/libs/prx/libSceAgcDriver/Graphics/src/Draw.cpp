@@ -2151,6 +2151,18 @@ void maybeReportResLookupSplit() {
     }
     if (aggregate.shapeErrors != 0) AgcDriver::ProfilePrint_nid_no_patch("[reslookup]   shape errors: %llu\n", static_cast<unsigned long long>(aggregate.shapeErrors));
     if (aggregate.clockViolations != 0) AgcDriver::ProfilePrint_nid_no_patch("[reslookup]   clock violations: %llu\n", static_cast<unsigned long long>(aggregate.clockViolations));
+    const auto uncacheable = static_cast<std::size_t>(ResLookupClass::Uncacheable);
+    if (aggregate.classCount[uncacheable] != 0) {
+        std::uint64_t reasons = 0;
+        char line[256];
+        int n = std::snprintf(line, sizeof(line), "[reslookup]   uncacheable reasons:");
+        for (std::size_t r = 1; r < ResLookupUncacheableReasonCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++r) {
+            reasons += aggregate.uncacheableReason[r];
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", ResLookupUncacheableReasonNames[r], static_cast<unsigned long long>(aggregate.uncacheableReason[r]));
+        }
+        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; none %llu, sum %llu / calls %llu", static_cast<unsigned long long>(aggregate.uncacheableReason[0]), static_cast<unsigned long long>(reasons), static_cast<unsigned long long>(aggregate.classCount[uncacheable]));
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    }
     if (SpaceSplitEnabled()) {
         static constexpr std::array<const char*, SpacePhaseCount> phaseNames{"initial", "completion", "firstFast", "decision", "refresh", "retry", "audit", "walk", "diagnosticWalk", "buffer", "bookkeeping"};
         static constexpr std::array<const char*, SpaceOutcomeCount> outcomeNames{"notInvoked", "notReached", "skippedSpaceHeld", "rejectImageViews", "rejectNotReusable", "epochHit", "epochDiagnosticHit", "epochDiagnosticFailure", "fastHit", "ownRefreshedHit", "fullWalkHit", "walkFailure", "bufferFailure"};
@@ -2180,6 +2192,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     const bool resLookupEnabled = ResLookupSplitEnabled();
     ResLookupSample resLookup(resLookupEnabled);
     resLookup.Begin();
+    resLookup.NoteGate(recordable, plan.candidate, plan.keyed);
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2264,7 +2277,6 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resLookup.Note(ResLookupClass::Fallback);
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
-                countCache(&DrawProfile::cacheMisses);
             } else {
                 resLookup.Note(ResLookupClass::Invalidated);
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());

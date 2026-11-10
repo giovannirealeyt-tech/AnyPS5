@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_reslookup_reasons_tests tests/ResLookupReasons.cpp)
+    target_include_directories(agc_reslookup_reasons_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_reslookup_reasons_tests PRIVATE libc)
+    set_target_properties(agc_reslookup_reasons_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_reslookup_reasons_tests)
+    add_test(NAME agc_reslookup_reasons COMMAND agc_reslookup_reasons_tests)
+    set_tests_properties(agc_reslookup_reasons PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_reslookup_reasons PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

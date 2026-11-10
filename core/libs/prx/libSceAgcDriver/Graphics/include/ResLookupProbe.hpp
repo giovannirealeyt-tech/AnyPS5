@@ -14,6 +14,21 @@ enum class ResLookupSpan : std::size_t {
 
 inline constexpr std::size_t ResLookupSpanCount = static_cast<std::size_t>(ResLookupSpan::Count);
 
+enum class ResLookupUncacheableReason : std::uint8_t {
+    None = 0, NotRecordable, NotCandidate, NotKeyed, Count
+};
+
+inline constexpr std::size_t ResLookupUncacheableReasonCount = static_cast<std::size_t>(ResLookupUncacheableReason::Count);
+
+inline constexpr const char* ResLookupUncacheableReasonNames[ResLookupUncacheableReasonCount]{"none", "notRecordable", "notCandidate", "notKeyed"};
+
+inline ResLookupUncacheableReason UncacheableReasonOf(bool recordable, bool candidate, bool keyed) {
+    if (!recordable) return ResLookupUncacheableReason::NotRecordable;
+    if (!candidate) return ResLookupUncacheableReason::NotCandidate;
+    if (!keyed) return ResLookupUncacheableReason::NotKeyed;
+    return ResLookupUncacheableReason::None;
+}
+
 enum class ResLookupClass : std::uint8_t {
     Uncacheable = 0, FindMiss, Fallback, Invalidated, Accepted, Unclassified, Count
 };
@@ -307,6 +322,9 @@ struct ResLookupRecord {
     std::uint64_t spanNs[ResLookupSpanCount]{};
     std::uint64_t spanMask = 0;
     bool cacheable = false;
+    bool recordable = false;
+    bool candidate = false;
+    bool keyed = false;
     bool findHit = false;
     bool clockViolation = false;
     bool shapeError = false;
@@ -324,6 +342,7 @@ struct ResLookupAggregate {
     std::uint64_t classTotalNs[ResLookupClassCount]{};
     std::uint64_t spanNs[ResLookupClassCount][ResLookupSpanCount]{};
     std::uint64_t spanCalls[ResLookupClassCount][ResLookupSpanCount]{};
+    std::uint64_t uncacheableReason[ResLookupUncacheableReasonCount]{};
     SpaceAggregate space;
 };
 
@@ -404,6 +423,12 @@ struct ResLookupSample {
     void NoteCacheable() {
         if (active) record.cacheable = true;
     }
+    void NoteGate(bool isRecordable, bool isCandidate, bool isKeyed) {
+        if (!active) return;
+        record.recordable = isRecordable;
+        record.candidate = isCandidate;
+        record.keyed = isKeyed;
+    }
     void NoteFindHit(bool hit) {
         if (active) record.findHit = hit;
     }
@@ -475,6 +500,10 @@ inline void ResLookupFold(ResLookupAggregate& aggregate, const ResLookupRecord& 
     const auto c = static_cast<std::size_t>(ResLookupClassOf(validated));
     if (clockViolation) ++aggregate.classClockViolations[c];
     ++aggregate.classCount[c];
+    if (c == static_cast<std::size_t>(ResLookupClass::Uncacheable)) {
+        const auto reason = static_cast<std::size_t>(UncacheableReasonOf(validated.recordable, validated.candidate, validated.keyed));
+        ++aggregate.uncacheableReason[reason];
+    }
     aggregate.classTotalNs[c] += validated.totalNs;
     FoldSpace(aggregate.space, c, validated.space);
     for (std::size_t s = 0; s < ResLookupSpanCount; ++s) {
