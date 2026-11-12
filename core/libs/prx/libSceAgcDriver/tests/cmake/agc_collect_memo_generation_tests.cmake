@@ -5,6 +5,10 @@ if(BUILD_TESTING)
             Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_collect_memo_generation_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    # The test target compiles its own copy of Execution/src/GuestMemory.cpp with the test-only
+    # timing hooks enabled; the production libSceAgcDriver target compiles the same file without
+    # this define, so the hooks and their state stay out of the shipped PRX.
+    target_compile_definitions(agc_collect_memo_generation_tests PRIVATE APS5_TEXTURE_COLLECT_TEST_HOOKS)
     target_link_libraries(agc_collect_memo_generation_tests PRIVATE shader_recompiler_agc_driver libc)
     set_target_properties(agc_collect_memo_generation_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_collect_memo_generation_tests)
@@ -12,7 +16,8 @@ if(BUILD_TESTING)
     add_test(NAME agc_collect_coverage_interior COMMAND agc_collect_memo_generation_tests --interior)
     add_test(NAME agc_collect_coverage_unions COMMAND agc_collect_memo_generation_tests --unions)
     add_test(NAME agc_collect_coverage_invalidation COMMAND agc_collect_memo_generation_tests --invalidation)
-    set(collect_memo_tests agc_collect_memo_generation agc_collect_coverage_interior agc_collect_coverage_unions agc_collect_coverage_invalidation)
+    add_test(NAME agc_collect_recheck_thread COMMAND agc_collect_memo_generation_tests --recheck-thread)
+    set(collect_memo_tests agc_collect_memo_generation agc_collect_coverage_interior agc_collect_coverage_unions agc_collect_coverage_invalidation agc_collect_recheck_thread)
     set_tests_properties(${collect_memo_tests} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
         set_tests_properties(${collect_memo_tests} PROPERTIES ENVIRONMENT_MODIFICATION

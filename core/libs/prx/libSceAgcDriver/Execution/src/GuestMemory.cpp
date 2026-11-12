@@ -1847,14 +1847,94 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     return complete;
 }
 
+namespace {
+thread_local int textureCollectDepth = 0;
+thread_local TextureCollectStats textureCollectStatsTls;
+#ifdef APS5_TEXTURE_COLLECT_TEST_HOOKS
+// Test-only clock injection (see detail::SetTextureCollectTestClock): absent from production
+// builds, which always read the real steady_clock below.
+detail::TextureCollectClockFn textureCollectClockNow = nullptr;
+// Test-only gate override (see detail::SetTextureCollectTimingOverride): absent from production
+// builds, which always consult the cached env gate below.
+const bool* textureCollectTimingOverride = nullptr;
+// FT17-L test-only recheck override (see detail::SetCollectRecheckMappingOverride): absent from
+// production builds, which always recheck against the real allocation generation.
+detail::CollectRecheckMappingFn collectRecheckMappingOverride = nullptr;
+#endif
+
+// Terminal categories of a scoped collectWrites call: exactly one per call, mutually exclusive.
+enum class CollectTiming : std::uint8_t { MemoHit, Walk, EarlyExit };
+
+std::uint64_t textureCollectClockNs() {
+#ifdef APS5_TEXTURE_COLLECT_TEST_HOOKS
+    if (textureCollectClockNow != nullptr) return textureCollectClockNow();
+#endif
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+bool textureCollectTimingOn() {
+#ifdef APS5_TEXTURE_COLLECT_TEST_HOOKS
+    if (textureCollectTimingOverride != nullptr) return *textureCollectTimingOverride;
+#endif
+    return TextureCollectTimingEnabled();
+}
+
+// Mapping generation read at the R3/R4 memo-probe recheck. Production always reads the real
+// allocation generation; the test-only override (see detail::SetCollectRecheckMappingOverride)
+// lets a single-threaded CPU check make that one recheck mismatch without mutating real state,
+// to exercise the fall-through deterministically.
+std::uint64_t recheckMappingGeneration() {
+#ifdef APS5_TEXTURE_COLLECT_TEST_HOOKS
+    if (collectRecheckMappingOverride != nullptr) return collectRecheckMappingOverride();
+#endif
+    return GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+}
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    const bool textureScope = textureCollectDepth > 0;
+    // Timing gate: separate from the D1 scope gate, default OFF. With it off this function
+    // performs no clock reading and no timing accumulation at all.
+    const bool timing = textureScope && textureCollectTimingOn();
+    if (textureScope) textureCollectStatsTls.calls++;
+    // t0/t1 perimeter: t0 after the calls counter, before the first classifying branch; t1
+    // immediately before each terminal return (R1-R9). The lockTracker RAII destructor, which
+    // releases the external tracker lock, always runs after t1 and is excluded. The walk's
+    // TimedAccess profiler destructs at the end of its inner block, so it is included in the
+    // R8/R9 buckets (the block ends before those returns) and excluded from R7, whose return
+    // leaves the block before that destructor runs. The post-walk memo/map recording precedes
+    // the R9 return and is included in that bucket. Each bucket measures the instrumented path
+    // to that return's category, not a total cost of the call and not an upper bound of the
+    // uninstrumented cost. TimedAccess is the walk profiler inside the timed span, not the
+    // timing clock itself.
+    const auto t0 = timing ? textureCollectClockNs() : std::uint64_t{0};
+    auto finish = [&](CollectTiming category, std::uint64_t result) -> std::uint64_t {
+        if (!timing) return result;
+        const auto t1 = textureCollectClockNs();
+        if (t1 < t0) {
+            ++textureCollectStatsTls.collectClockViolations;
+            return result;
+        }
+        const auto delta = t1 - t0;
+        if (category == CollectTiming::MemoHit) textureCollectStatsTls.nsMemoHit += delta;
+        else if (category == CollectTiming::Walk) textureCollectStatsTls.nsWalk += delta;
+        else textureCollectStatsTls.nsEarlyExit += delta;
+        return result;
+    };
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) {
+        if (textureScope) textureCollectStatsTls.earlyExitPreWalk++;
+        return finish(CollectTiming::EarlyExit, 0);
+    }
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
     auto first = address & ~(page - 1);
     auto stop = (address + bytes + page - 1) & ~(page - 1);
-    if (stop <= first) return 0;
+    if (stop <= first) {
+        if (textureScope) textureCollectStatsTls.earlyExitPreWalk++;
+        return finish(CollectTiming::EarlyExit, 0);
+    }
     // One epoch for the lookup and the entry made after the walk: an unbumped thread's fresh epoch
     // must not differ between them.
     const auto epoch = currentCollectEpoch();
@@ -1869,9 +1949,16 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch, unwatched, mapping);
             if (map.Covers(first, stop)) {
+                // FT17-L: the global probe counter stays pre-recheck (preexisting telemetry),
+                // but the TLS outcome counters now wait for a successful mapping recheck. A
+                // mismatch falls through below without claiming a memo-hit outcome, so the
+                // single terminal's counters and timing bucket keep matching the real return.
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 const auto stable = tracker.stable.load(std::memory_order_acquire);
-                if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() == observedMapping) return stable;
+                if (recheckMappingGeneration() == observedMapping) {
+                    if (textureScope) { textureCollectStatsTls.memoHits++; textureCollectStatsTls.memoHitEpochMap++; }
+                    return finish(CollectTiming::MemoHit, stable);
+                }
             }
         }
         for (const auto& entry : threadCollectMemo().entries) {
@@ -1879,21 +1966,29 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
+                // FT17-L: as in the eMap probe, the TLS outcome counters wait for the recheck.
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 const auto stable = tracker.stable.load(std::memory_order_acquire);
-                if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() == observedMapping) return stable;
+                if (recheckMappingGeneration() == observedMapping) {
+                    if (textureScope) { textureCollectStatsTls.memoHits++; textureCollectStatsTls.memoHitThread++; }
+                    return finish(CollectTiming::MemoHit, stable);
+                }
             }
         }
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) {
+        if (textureScope) textureCollectStatsTls.earlyExitPreWalk++;
+        return finish(CollectTiming::EarlyExit, 0);
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                return tracker.generation;
+                if (textureScope) { textureCollectStatsTls.memoHits++; textureCollectStatsTls.memoHitShared++; }
+                return finish(CollectTiming::MemoHit, tracker.generation);
             }
         }
     }
@@ -1909,12 +2004,16 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     bool walked;
     {
+        if (textureScope) textureCollectStatsTls.walkAttempted++;
         const auto walkKind = ThreadCollectEpoch() == 0 ? CounterCollectWalkUnbumped : CounterCollectWalkBumped;
         const TimedAccess walkTimed(walkKind, bytes);
         walked = true;
         if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
 #ifdef _WIN32
-            if (first == requestedFirst && stop == requestedStop) return 0;
+            if (first == requestedFirst && stop == requestedStop) {
+                if (textureScope) textureCollectStatsTls.walkFailed++;
+                return finish(CollectTiming::Walk, 0);
+            }
             first = requestedFirst;
             stop = requestedStop;
             walked = walkWrites(tracker, first, stop, StampKind::Cpu);
@@ -1923,7 +2022,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 #endif
         }
     }
-    if (!walked) return 0;
+    if (!walked) {
+        if (textureScope) textureCollectStatsTls.walkFailed++;
+        return finish(CollectTiming::Walk, 0);
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1938,7 +2040,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
-    return tracker.generation;
+    return finish(CollectTiming::Walk, tracker.generation);
 }
 
 }
@@ -2892,6 +2994,39 @@ std::uint32_t GpuMutexType::DepthOnThisThread() const {
     // `depth` is written by the holder only, so it is read only when that is this thread.
     return HeldByThisThread() ? depth : 0;
 }
+
+void EnterTextureCollectScope() {
+    ++textureCollectDepth;
+    if (textureCollectDepth == 1) {
+        textureCollectStatsTls = TextureCollectStats{};
+    }
+}
+
+void LeaveTextureCollectScope() {
+    if (textureCollectDepth > 0) --textureCollectDepth;
+}
+
+TextureCollectStats TakeTextureCollectStats() {
+    TextureCollectStats out = textureCollectStatsTls;
+    textureCollectStatsTls = TextureCollectStats{};
+    return out;
+}
+
+#ifdef APS5_TEXTURE_COLLECT_TEST_HOOKS
+namespace detail {
+void SetTextureCollectTestClock(TextureCollectClockFn now) noexcept {
+    textureCollectClockNow = now;
+}
+
+void SetTextureCollectTimingOverride(const bool* enabled) noexcept {
+    textureCollectTimingOverride = enabled;
+}
+
+void SetCollectRecheckMappingOverride(CollectRecheckMappingFn override) noexcept {
+    collectRecheckMappingOverride = override;
+}
+}
+#endif
 
 void AssertGpuLockHeld(const char* where) {
     static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResLookupProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -3438,11 +3439,16 @@ std::size_t ShaderResources::LookupLogCapacity() {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
-bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
+bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, bool retry) {
+    auto* fastStats = ActiveFastStats(retry);
+    if (fastStats != nullptr) ++fastStats->invocations;
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
-    if (!EpochRevalidate()) return fastRevalidateEach();
+    if (!EpochRevalidate()) {
+        if (fastStats != nullptr) ++fastStats->eachFallback;
+        return fastRevalidateEach();
+    }
     const auto fail = [&reason](FastFail why) {
         reason = why;
         countFastFail(why);
@@ -3450,6 +3456,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
+    if (fastStats != nullptr) {
+        if (unchanged) ++fastStats->pendingSerialUnchanged;
+        else ++fastStats->pendingSerialChanged;
+    }
     const bool keyProofs = KeyFastPath();
     struct QueriesTag {};
     auto& queries = ThreadScratch<std::vector<GuestMemory::UnchangedQuery>, QueriesTag>();
@@ -3520,39 +3530,77 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (BuildProfiled()) (proved ? Revalidations().untrackedSnapshotsProved : Revalidations().untrackedSnapshotsFallback).fetch_add(1, std::memory_order_relaxed);
         return proved;
     };
+    FastSection texturePrep(fastStats, FastPart::TexturePrep);
+    auto* textureStats = ActiveTextureStats(retry);
     for (std::size_t i = 0; i < textures.size(); ++i) {
+        if (fastStats != nullptr) ++fastStats->textures;
         auto& surface = validatedTextures[i];
-        if (!surface.valid) return fail(FastFail::NoRecord);
-        if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
-            continue;
+        {
+            TextureSection controlTiming(textureStats, TexturePart::Controls);
+            if (!surface.valid) return fail(FastFail::NoRecord);
+            if (surface.depth) {
+                if (textureStats != nullptr) ++textureStats->depth;
+                if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+                continue;
+            }
+            if (textures[i]->Released()) return fail(FastFail::Replaced);
         }
-        if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        {
+            TextureSection flushTiming(textureStats, TexturePart::FlushDepth);
+            if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
+        }
+        {
+            TextureSection collectTiming(textureStats, TexturePart::Collect);
+            if (textureStats != nullptr) AgcDriver::GuestMemory::EnterTextureCollectScope();
+            surface.collected = GuestMemory::CollectWrites(address, bytes);
+            if (textureStats != nullptr) {
+                auto tstats = AgcDriver::GuestMemory::TakeTextureCollectStats();
+                textureStats->collectCalls += tstats.calls;
+                textureStats->collectMemoHits += tstats.memoHits;
+                textureStats->collectMemoHitEpochMap += tstats.memoHitEpochMap;
+                textureStats->collectMemoHitThread += tstats.memoHitThread;
+                textureStats->collectMemoHitShared += tstats.memoHitShared;
+                textureStats->collectWalkAttempted += tstats.walkAttempted;
+                textureStats->collectWalkFailed += tstats.walkFailed;
+                textureStats->collectEarlyExitPreWalk += tstats.earlyExitPreWalk;
+                textureStats->collectNsMemoHit += tstats.nsMemoHit;
+                textureStats->collectNsWalk += tstats.nsWalk;
+                textureStats->collectNsEarlyExit += tstats.nsEarlyExit;
+                textureStats->collectClockViolations += tstats.collectClockViolations;
+            }
+            if (textureStats != nullptr) AgcDriver::GuestMemory::LeaveTextureCollectScope();
+        }
         bool viewRefreshed = false;
         bool snapshotCompared = false;
         if (surface.collected == 0) {
+            if (textureStats != nullptr) ++textureStats->collectZero;
             countCollectRefusal(false, address, bytes);
             if (!FastRevalidateGate() || !keyProofs) return fail(FastFail::Collect);
             if (surface.source != nullptr) {
+                if (textureStats != nullptr) ++textureStats->refresh;
+                TextureSection refreshTiming(textureStats, TexturePart::RefreshUncollected);
                 if (!refreshUncollected(textures[i]->SharedStorageSource(), surface.source)) return fail(FastFail::Collect);
                 viewRefreshed = true;
             } else {
+                if (textureStats != nullptr) ++textureStats->compare;
+                TextureSection compareTiming(textureStats, TexturePart::CompareUncollected);
                 if (!compareUncollected(i)) return fail(FastFail::Collect);
                 snapshotCompared = true;
             }
         }
         const auto* source = surface.source;
+        TextureSection proofTiming(textureStats, TexturePart::Proofs);
         if (!keyProofs) {
+            if (textureStats != nullptr) ++textureStats->proofScan;
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
             if (surface.resource.dccAddress != 0 && TextureClearKeys(surface.resource, surface.bytes) != surface.keys) return fail(FastFail::Keys);
             scannedKeys[i] = surface.keys;
             if (!unchanged) query(address, address + bytes, source, source != nullptr && surface.keys != DccKeys::Uncompressed ? source : nullptr, {i, false, source != nullptr && surface.keys == DccKeys::Uncompressed});
         } else if (source != nullptr) {
+            if (textureStats != nullptr) ++textureStats->source;
             // The view follows its image, so it stays valid while the image would Refresh as
             // unchanged: the image's own keys must be what its content was uploaded under (its
             // proof answers without a scan while they are unstamped), and its memory unchanged
@@ -3573,6 +3621,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             else if (!unchanged) query(address, address + bytes, source, nullptr, {i, false, keys == DccKeys::Uncompressed});
             if (surface.resource.dccAddress != 0 || own.dccAddress != 0) countKeysProven(false);
         } else {
+            if (textureStats != nullptr) ++textureStats->snapshot;
             // A snapshot holds its clear texels or the guest bytes: the keys must be what it was made under.
             const auto keys = surface.resource.dccAddress != 0 ? ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) : DccKeys::Uncompressed;
             if (keys != surface.keys) return fail(FastFail::Keys);
@@ -3580,15 +3629,22 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
             if (surface.resource.dccAddress != 0) countKeysProven(false);
         }
-        if (source != nullptr) {
-            if (!source->Cached()) return fail(FastFail::Evicted);
-            if (!viewRefreshed) queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
-            images.push_back(source);
-        } else if (!snapshotCompared) {
-            queries.push_back({address, bytes, surface.generation});
+        proofTiming.Stop();
+        {
+            TextureSection prepTiming(textureStats, TexturePart::Prep);
+            if (source != nullptr) {
+                if (!source->Cached()) return fail(FastFail::Evicted);
+                if (!viewRefreshed) queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
+                images.push_back(source);
+            } else if (!snapshotCompared) {
+                queries.push_back({address, bytes, surface.generation});
+            }
         }
     }
+    texturePrep.Stop();
+    FastSection storagePrep(fastStats, FastPart::StoragePrep);
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        if (fastStats != nullptr) ++fastStats->storage;
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
@@ -3618,6 +3674,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!storageRefreshed) queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
         images.push_back(image);
     }
+    storagePrep.Stop();
+    if (fastStats != nullptr) fastStats->pending += pending.size();
+    if (textureStats != nullptr && !pending.empty()) ++textureStats->pendingCalls;
+    FastSection scanPendingPart(fastStats, FastPart::ScanPending);
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -3658,14 +3718,24 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
-    if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
+    scanPendingPart.Stop();
+    FastSection unchangedPart(fastStats, FastPart::Unchanged);
+    if (fastStats != nullptr) fastStats->queries += queries.size();
+    const bool unchangedAll = GuestMemory::UnchangedSinceAll(queries);
+    unchangedPart.Stop();
+    if (!unchangedAll) return fail(FastFail::Changed);
+    FastSection imagesCachedPart(fastStats, FastPart::ImagesCached);
+    const bool imagesCached = StorageImagesCached(context, images);
+    imagesCachedPart.Stop();
+    if (!imagesCached) return fail(FastFail::Evicted);
+    FastSection finalizePart(fastStats, FastPart::Finalize);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
+    finalizePart.Stop();
     return true;
 }
 
@@ -4079,7 +4149,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     FastFail reason = FastFail::Count;
     bool accepted = false;
     SpaceMark(SpacePhase::FirstFast);
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, false);
     SpaceEndPhase();
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
@@ -4097,7 +4167,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         SpaceEndPhase();
         if (fallback == OwnRefreshFallback::Count) {
             SpaceMark(SpacePhase::Retry);
-            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, true);
             SpaceEndPhase();
             if (fast) ownRefreshed = true;
             else fallback = OwnRefreshFallback::Rerun;

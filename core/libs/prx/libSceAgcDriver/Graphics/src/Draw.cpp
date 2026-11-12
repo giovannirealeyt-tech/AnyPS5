@@ -2184,6 +2184,47 @@ void maybeReportResLookupSplit() {
                 n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; %s %llu ns / %llu", phaseNames[p], static_cast<unsigned long long>(aggregate.space.phaseNs[c][p]), static_cast<unsigned long long>(aggregate.space.phaseCalls[c][p]));
             }
             AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+            for (int pass = 0; pass < 2; ++pass) {
+                const FastStats& fast = pass == 0 ? aggregate.space.fastFirst[c] : aggregate.space.fastRetry[c];
+                const TextureStats& texture = pass == 0 ? aggregate.space.textureFirst[c] : aggregate.space.textureRetry[c];
+                if (fast.invocations == 0) continue;
+                char fastLine[1024];
+                int m = std::snprintf(fastLine, sizeof(fastLine), "[resspace]   %s: %s inv %llu eachFallback %llu textures %llu storage %llu queries %llu pending %llu serialUnchanged %llu serialChanged %llu", classNames[c], pass == 0 ? "fastFirst" : "fastRetry", static_cast<unsigned long long>(fast.invocations), static_cast<unsigned long long>(fast.eachFallback), static_cast<unsigned long long>(fast.textures), static_cast<unsigned long long>(fast.storage), static_cast<unsigned long long>(fast.queries), static_cast<unsigned long long>(fast.pending), static_cast<unsigned long long>(fast.pendingSerialUnchanged), static_cast<unsigned long long>(fast.pendingSerialChanged));
+                for (std::size_t p = 0; p < FastPartCount && m > 0 && static_cast<std::size_t>(m) < sizeof(fastLine); ++p) {
+                    m += std::snprintf(fastLine + m, sizeof(fastLine) - static_cast<std::size_t>(m), "; %s %llu ns / %llu", FastPartNames[p], static_cast<unsigned long long>(fast.ns[p]), static_cast<unsigned long long>(fast.calls[p]));
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("%s\n", fastLine);
+                char textureLine[1024];
+                int t = std::snprintf(textureLine, sizeof(textureLine), "[resspace]   %s: %s visits %llu pendingCalls %llu depth %llu source %llu snapshot %llu collectZero %llu refresh %llu compare %llu proofScan %llu", classNames[c], pass == 0 ? "textureFirst" : "textureRetry", static_cast<unsigned long long>(fast.textures), static_cast<unsigned long long>(texture.pendingCalls), static_cast<unsigned long long>(texture.depth), static_cast<unsigned long long>(texture.source), static_cast<unsigned long long>(texture.snapshot), static_cast<unsigned long long>(texture.collectZero), static_cast<unsigned long long>(texture.refresh), static_cast<unsigned long long>(texture.compare), static_cast<unsigned long long>(texture.proofScan));
+                if (texture.collectCalls != 0 || texture.collectMemoHits != 0 || texture.collectWalkAttempted != 0) {
+                    if (t > 0 && static_cast<std::size_t>(t) < sizeof(textureLine)) t += std::snprintf(textureLine + t, sizeof(textureLine) - static_cast<std::size_t>(t), " | collect calls %llu memoHits %llu (eMap %llu thrd %llu shrd %llu) walkAttempt %llu walkFail %llu earlyExit %llu", static_cast<unsigned long long>(texture.collectCalls), static_cast<unsigned long long>(texture.collectMemoHits), static_cast<unsigned long long>(texture.collectMemoHitEpochMap), static_cast<unsigned long long>(texture.collectMemoHitThread), static_cast<unsigned long long>(texture.collectMemoHitShared), static_cast<unsigned long long>(texture.collectWalkAttempted), static_cast<unsigned long long>(texture.collectWalkFailed), static_cast<unsigned long long>(texture.collectEarlyExitPreWalk));
+                }
+                for (std::size_t p = 0; p < TexturePartCount && t > 0 && static_cast<std::size_t>(t) < sizeof(textureLine); ++p) {
+                    t += std::snprintf(textureLine + t, sizeof(textureLine) - static_cast<std::size_t>(t), "; %s %llu ns / %llu", TexturePartNames[p], static_cast<unsigned long long>(texture.ns[p]), static_cast<unsigned long long>(texture.calls[p]));
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("%s\n", textureLine);
+                // FT17-C timing companion: a versioned line of its own so the legacy texture
+                // line above stays byte-identical and the Python audit parser (which matches
+                // the exact "[resspace]" substring) skips it. Emitted right after the texture
+                // line of the same class/pass, inside the same window header, so class, pass
+                // and window are unambiguous from the nearest [resspace] header above it.
+                const bool timingOn = AgcDriver::GuestMemory::TextureCollectTimingEnabled();
+                char timingLine[1024];
+                if (timingOn) {
+                    const auto sumTiming = texture.collectNsMemoHit + texture.collectNsWalk + texture.collectNsEarlyExit;
+                    const auto collectSectionNs = texture.ns[static_cast<std::size_t>(TexturePart::Collect)];
+                    // The residual is a derived difference, not an independent check: the two raw
+                    // quantities are both reported, and a bucket sum above the section time raises
+                    // a separate mismatch flag (never folded into clockViolations, never clamped).
+                    const auto timingMismatch = static_cast<std::uint64_t>(sumTiming > collectSectionNs);
+                    int w = std::snprintf(timingLine, sizeof(timingLine), "[resspace-timing-v1]   %s: %s timing on coverage=all instrumentedCalls %llu nsMemoHit %llu nsWalk %llu nsEarlyExit %llu sumTimingNs %llu collectSectionNs %llu timingMismatch %llu clockViolations %llu", classNames[c], pass == 0 ? "textureFirst" : "textureRetry", static_cast<unsigned long long>(texture.collectCalls), static_cast<unsigned long long>(texture.collectNsMemoHit), static_cast<unsigned long long>(texture.collectNsWalk), static_cast<unsigned long long>(texture.collectNsEarlyExit), static_cast<unsigned long long>(sumTiming), static_cast<unsigned long long>(collectSectionNs), static_cast<unsigned long long>(timingMismatch), static_cast<unsigned long long>(texture.collectClockViolations));
+                    static_cast<void>(w);
+                } else {
+                    int w = std::snprintf(timingLine, sizeof(timingLine), "[resspace-timing-v1]   %s: %s timing off coverage=none (gate APS5_TEXTURE_COLLECT_TIMING unset: no clock readings were taken, no bucket is a measured zero)", classNames[c], pass == 0 ? "textureFirst" : "textureRetry");
+                    static_cast<void>(w);
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("%s\n", timingLine);
+            }
         }
     }
 }

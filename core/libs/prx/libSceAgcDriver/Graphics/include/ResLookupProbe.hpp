@@ -42,6 +42,22 @@ enum class SpacePhase : std::size_t {
 
 inline constexpr std::size_t SpacePhaseCount = static_cast<std::size_t>(SpacePhase::Count);
 
+enum class FastPart : std::size_t {
+    TexturePrep = 0, StoragePrep, ScanPending, Unchanged, ImagesCached, Finalize, Count
+};
+
+inline constexpr std::size_t FastPartCount = static_cast<std::size_t>(FastPart::Count);
+
+inline constexpr const char* FastPartNames[FastPartCount]{"texturePrep", "storagePrep", "scanPending", "unchanged", "imagesCached", "finalize"};
+
+enum class TexturePart : std::size_t {
+    Controls = 0, FlushDepth, Collect, RefreshUncollected, CompareUncollected, Proofs, Prep, Count
+};
+
+inline constexpr std::size_t TexturePartCount = static_cast<std::size_t>(TexturePart::Count);
+
+inline constexpr const char* TexturePartNames[TexturePartCount]{"controls", "flushDepth", "collect", "refresh", "compare", "proofs", "prep"};
+
 enum class SpacePath : std::uint8_t {
     NotInvoked = 0, Epoch, Fast, OwnRefreshed, FullWalk, Count
 };
@@ -58,6 +74,130 @@ inline constexpr std::uint64_t MaxSpacePhaseRepeats = 4;
 inline std::uint64_t SpaceNow() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+
+struct FastStats {
+    std::uint64_t ns[FastPartCount]{};
+    std::uint64_t calls[FastPartCount]{};
+    std::uint64_t invocations = 0;
+    std::uint64_t eachFallback = 0;
+    std::uint64_t textures = 0;
+    std::uint64_t storage = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t pendingSerialUnchanged = 0;
+    std::uint64_t pendingSerialChanged = 0;
+};
+
+inline void FoldFast(FastStats& aggregate, const FastStats& data) {
+    for (std::size_t p = 0; p < FastPartCount; ++p) {
+        aggregate.ns[p] += data.ns[p];
+        aggregate.calls[p] += data.calls[p];
+    }
+    aggregate.invocations += data.invocations;
+    aggregate.eachFallback += data.eachFallback;
+    aggregate.textures += data.textures;
+    aggregate.storage += data.storage;
+    aggregate.queries += data.queries;
+    aggregate.pending += data.pending;
+    aggregate.pendingSerialUnchanged += data.pendingSerialUnchanged;
+    aggregate.pendingSerialChanged += data.pendingSerialChanged;
+}
+
+struct FastSection {
+    FastStats* stats;
+    FastPart part;
+    std::uint64_t started;
+    explicit FastSection(FastStats* target, FastPart which) : stats(target), part(which), started(target != nullptr ? SpaceNow() : 0) {}
+    ~FastSection() { Stop(); }
+    void Stop() {
+        if (stats == nullptr) return;
+        const auto now = SpaceNow();
+        const auto elapsed = now >= started;
+        if (elapsed) {
+            const auto index = static_cast<std::size_t>(part);
+            stats->ns[index] += now - started;
+            ++stats->calls[index];
+        }
+        stats = nullptr;
+    }
+    FastSection(const FastSection&) = delete;
+    FastSection& operator=(const FastSection&) = delete;
+};
+
+struct TextureStats {
+    std::uint64_t ns[TexturePartCount]{};
+    std::uint64_t calls[TexturePartCount]{};
+    std::uint64_t depth = 0;
+    std::uint64_t source = 0;
+    std::uint64_t snapshot = 0;
+    std::uint64_t collectZero = 0;
+    std::uint64_t refresh = 0;
+    std::uint64_t compare = 0;
+    std::uint64_t proofScan = 0;
+    std::uint64_t pendingCalls = 0;
+    std::uint64_t collectCalls = 0;
+    std::uint64_t collectMemoHits = 0;
+    std::uint64_t collectMemoHitEpochMap = 0;
+    std::uint64_t collectMemoHitThread = 0;
+    std::uint64_t collectMemoHitShared = 0;
+    std::uint64_t collectWalkAttempted = 0;
+    std::uint64_t collectWalkFailed = 0;
+    std::uint64_t collectEarlyExitPreWalk = 0;
+    // FT17-C direct timing buckets folded from TextureCollectStats (same granularity: window x
+    // class x pass first/retry). Zero when the timing gate is off; see GuestMemory.hpp.
+    std::uint64_t collectNsMemoHit = 0;
+    std::uint64_t collectNsWalk = 0;
+    std::uint64_t collectNsEarlyExit = 0;
+    std::uint64_t collectClockViolations = 0;
+};
+
+inline void FoldTexture(TextureStats& aggregate, const TextureStats& data) {
+    for (std::size_t p = 0; p < TexturePartCount; ++p) {
+        aggregate.ns[p] += data.ns[p];
+        aggregate.calls[p] += data.calls[p];
+    }
+    aggregate.depth += data.depth;
+    aggregate.source += data.source;
+    aggregate.snapshot += data.snapshot;
+    aggregate.collectZero += data.collectZero;
+    aggregate.refresh += data.refresh;
+    aggregate.compare += data.compare;
+    aggregate.proofScan += data.proofScan;
+    aggregate.pendingCalls += data.pendingCalls;
+    aggregate.collectCalls += data.collectCalls;
+    aggregate.collectMemoHits += data.collectMemoHits;
+    aggregate.collectMemoHitEpochMap += data.collectMemoHitEpochMap;
+    aggregate.collectMemoHitThread += data.collectMemoHitThread;
+    aggregate.collectMemoHitShared += data.collectMemoHitShared;
+    aggregate.collectWalkAttempted += data.collectWalkAttempted;
+    aggregate.collectWalkFailed += data.collectWalkFailed;
+    aggregate.collectEarlyExitPreWalk += data.collectEarlyExitPreWalk;
+    aggregate.collectNsMemoHit += data.collectNsMemoHit;
+    aggregate.collectNsWalk += data.collectNsWalk;
+    aggregate.collectNsEarlyExit += data.collectNsEarlyExit;
+    aggregate.collectClockViolations += data.collectClockViolations;
+}
+
+struct TextureSection {
+    TextureStats* stats;
+    TexturePart part;
+    std::uint64_t started;
+    explicit TextureSection(TextureStats* target, TexturePart which) : stats(target), part(which), started(target != nullptr ? SpaceNow() : 0) {}
+    ~TextureSection() { Stop(); }
+    void Stop() {
+        if (stats == nullptr) return;
+        const auto now = SpaceNow();
+        const auto elapsed = now >= started;
+        if (elapsed) {
+            const auto index = static_cast<std::size_t>(part);
+            stats->ns[index] += now - started;
+            ++stats->calls[index];
+        }
+        stats = nullptr;
+    }
+    TextureSection(const TextureSection&) = delete;
+    TextureSection& operator=(const TextureSection&) = delete;
+};
 
 inline bool SpaceSplitEnabled() {
     static const bool enabled = std::getenv("APS5_RESLOOKUP_SPACE") != nullptr;
@@ -82,6 +222,10 @@ struct SpaceData {
     std::int64_t residualNs = 0;
     std::uint64_t phaseNs[SpacePhaseCount]{};
     std::uint64_t phaseCalls[SpacePhaseCount]{};
+    FastStats fastFirst;
+    FastStats fastRetry;
+    TextureStats textureFirst;
+    TextureStats textureRetry;
 };
 
 struct SpaceAggregate {
@@ -95,6 +239,10 @@ struct SpaceAggregate {
     std::uint64_t outcome[ResLookupClassCount][SpaceOutcomeCount]{};
     std::uint64_t phaseNs[ResLookupClassCount][SpacePhaseCount]{};
     std::uint64_t phaseCalls[ResLookupClassCount][SpacePhaseCount]{};
+    FastStats fastFirst[ResLookupClassCount];
+    FastStats fastRetry[ResLookupClassCount];
+    TextureStats textureFirst[ResLookupClassCount];
+    TextureStats textureRetry[ResLookupClassCount];
 };
 
 struct SpaceProbeScope;
@@ -198,6 +346,18 @@ struct SpaceProbeScope {
     SpaceProbeScope(const SpaceProbeScope&) = delete;
     SpaceProbeScope& operator=(const SpaceProbeScope&) = delete;
 };
+
+inline FastStats* ActiveFastStats(bool retry) {
+    auto* probe = activeSpaceProbe();
+    if (probe == nullptr || probe->data == nullptr) return nullptr;
+    return retry ? &probe->data->fastRetry : &probe->data->fastFirst;
+}
+
+inline TextureStats* ActiveTextureStats(bool retry) {
+    auto* probe = activeSpaceProbe();
+    if (probe == nullptr || probe->data == nullptr) return nullptr;
+    return retry ? &probe->data->textureRetry : &probe->data->textureFirst;
+}
 
 inline bool ValidateSpace(const SpaceData& data) {
     if (!data.enabled) return true;
@@ -315,6 +475,10 @@ inline void FoldSpace(SpaceAggregate& aggregate, std::size_t c, const SpaceData&
         aggregate.phaseNs[c][p] += data.phaseNs[p];
         aggregate.phaseCalls[c][p] += data.phaseCalls[p];
     }
+    FoldFast(aggregate.fastFirst[c], data.fastFirst);
+    FoldFast(aggregate.fastRetry[c], data.fastRetry);
+    FoldTexture(aggregate.textureFirst[c], data.textureFirst);
+    FoldTexture(aggregate.textureRetry[c], data.textureRetry);
 }
 
 struct ResLookupRecord {

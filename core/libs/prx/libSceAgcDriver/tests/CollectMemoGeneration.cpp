@@ -316,10 +316,345 @@ void CheckCoverageThreadAndDriverWrites() {
     Require(Walked(Base + Block, 2 * Block, Base + Block + Page, false), "an uncached collection reused an observation");
 }
 
+void CheckScopePartitionWalkThenMemo() {
+    BumpCollectEpoch();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto probe = Base + 92 * Block + 4 * Page + 64;
+    EnterTextureCollectScope();
+    const auto before = TrackerGeneration();
+    Store(probe);
+    const auto walked = CollectWrites(address, 2 * Page);
+    const auto memoized = CollectWrites(address, 2 * Page);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(walked != 0 && memoized != 0, "a scoped collect failed");
+    Require(!UnchangedSince(probe & ~(Page - 1), Page, before), "the first scoped collect did not reach the write watch");
+    Require(stats.calls == 2, "the scoped collect miscounted its calls");
+    Require(stats.earlyExitPreWalk == 0, "a clean scoped range took an early exit");
+    Require(stats.walkAttempted == 1, "the first scoped collect was not accounted as a walk attempt");
+    Require(stats.memoHits == 1, "the memoized scoped collect was not accounted as a memo hit");
+    Require(stats.memoHits == stats.memoHitEpochMap + stats.memoHitThread + stats.memoHitShared, "the memo hit sites do not sum to the memo hits");
+    Require(stats.walkFailed <= stats.walkAttempted, "the scoped walk failures exceed the walk attempts");
+    Require(stats.calls == stats.earlyExitPreWalk + stats.memoHits + stats.walkAttempted, "the scoped collect partition does not hold");
+}
+
+void CheckScopeEarlyExit() {
+    EnterTextureCollectScope();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto empty = CollectWrites(address, 0);
+    const auto wrapped = CollectWrites(std::numeric_limits<std::uint64_t>::max() - 31, 8);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(empty == 0 && wrapped == 0, "an empty or overflowing scoped range returned a generation");
+    Require(stats.calls == 2 && stats.earlyExitPreWalk == 2, "the scoped early exits were miscounted");
+    Require(stats.calls == stats.earlyExitPreWalk + stats.memoHits + stats.walkAttempted, "the scoped early exit partition does not hold");
+}
+
+void CheckTakeResetsScopeStats() {
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    Require(CollectWrites(Base + 93 * Block + 3 * Page, Page) != 0, "the scoped collect before the take failed");
+    const auto first = TakeTextureCollectStats();
+    const auto second = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(first.calls == 1 && first.walkAttempted == 1, "the first take did not report the scoped collect");
+    Require(second.calls == 0, "the take did not reset the scoped stats");
+}
+
+void CheckUnscopedCallsDoNotContaminate() {
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    Require(CollectWrites(Base + 93 * Block + 3 * Page, Page) != 0, "the scoped collect failed");
+    const auto scoped = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(CollectWrites(Base + 93 * Block + 3 * Page, Page) != 0, "the unscoped collect failed");
+    const auto unscoped = TakeTextureCollectStats();
+    Require(scoped.calls == 1, "the scoped collect was miscounted");
+    Require(unscoped.calls == 0, "an unscoped collect contaminated the texture stats");
+}
+
+void CheckScopeStatsAreThreadLocal() {
+    BumpCollectEpoch();
+    std::uint64_t foreign = 0;
+    EnterTextureCollectScope();
+    std::thread worker([&] {
+        EnterTextureCollectScope();
+        Require(CollectWrites(Base + 94 * Block + 3 * Page, Page) != 0, "the scoped collect on the worker failed");
+        const auto workerStats = TakeTextureCollectStats();
+        LeaveTextureCollectScope();
+        foreign = workerStats.calls;
+    });
+    worker.join();
+    Require(CollectWrites(Base + 92 * Block + 7 * Page, Page) != 0, "the scoped collect on the main thread failed");
+    const auto local = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(foreign == 1, "the worker scope miscounted its collects");
+    Require(local.calls == 1, "the main thread scope counted the worker's collects");
+    Require(local.calls == local.earlyExitPreWalk + local.memoHits + local.walkAttempted, "the main thread partition does not hold");
+}
+
+void CheckScopedCollectMatchesUnscoped() {
+    BumpCollectEpoch();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto probe = Base + 92 * Block + 4 * Page + 64;
+    const auto beforeScoped = TrackerGeneration();
+    Store(probe);
+    EnterTextureCollectScope();
+    const auto scoped = CollectWrites(address, 2 * Page);
+    const auto scopedStats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    BumpCollectEpoch();
+    const auto address2 = Base + 93 * Block + 3 * Page + 100;
+    const auto probe2 = Base + 93 * Block + 4 * Page + 64;
+    const auto beforeUnscoped = TrackerGeneration();
+    Store(probe2);
+    const auto unscoped = CollectWrites(address2, 2 * Page);
+    Require(scoped != 0 && unscoped != 0, "a scoped or unscoped collect failed");
+    Require(scopedStats.walkAttempted == 1 && scopedStats.memoHits == 0, "the scoped collect was not a clean walk");
+    Require(!UnchangedSince(probe & ~(Page - 1), Page, beforeScoped), "the scoped collect did not reach the write watch");
+    Require(!UnchangedSince(probe2 & ~(Page - 1), Page, beforeUnscoped), "the unscoped collect did not reach the write watch");
+}
+
+void CheckNestedScopeTake() {
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    Require(CollectWrites(Base + 94 * Block + 3 * Page, Page) != 0, "the first scoped collect failed");
+    EnterTextureCollectScope();
+    const auto nested = TakeTextureCollectStats();
+    Require(nested.calls == 1, "a second enter reset the accumulated scoped stats");
+    Require(CollectWrites(Base + 94 * Block + 5 * Page, Page) != 0, "the scoped collect while the depth was two failed");
+    LeaveTextureCollectScope();
+    const auto outer = TakeTextureCollectStats();
+    const auto after = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(outer.calls == 1, "the take while the depth was two miscounted");
+    Require(after.calls == 0, "the stats survived the take while the depth was two");
+}
+
+// Test-only clock and gate hooks for the FT17-C timing checks: an injectable monotonic ns
+// clock (a steady advance per reading) and the gate override, both restored on scope exit so
+// the other checks keep the production clock and the env gate.
+struct TextureTestClock {
+    std::uint64_t now = 1000;
+    std::uint64_t step = 0;
+    std::uint64_t readings = 0;
+    bool retrogradeSoon = false;
+    bool retrogradeNext = false;
+};
+
+TextureTestClock textureTestClock;
+
+std::uint64_t TextureTestClockNow() {
+    auto& clock = textureTestClock;
+    ++clock.readings;
+    const auto retrograde = clock.retrogradeNext;
+    clock.retrogradeNext = false;
+    if (clock.retrogradeSoon) {
+        clock.retrogradeSoon = false;
+        clock.retrogradeNext = true;
+    }
+    if (retrograde) {
+        clock.now = clock.now > 0 ? clock.now - 1 : 0;
+        return clock.now;
+    }
+    const auto reported = clock.now;
+    clock.now += clock.step;
+    return reported;
+}
+
+struct TextureTimingHooks {
+    bool enabled = false;
+    TextureTimingHooks() = default;
+    explicit TextureTimingHooks(bool on) : enabled(on) {
+        textureTestClock = TextureTestClock{};
+        detail::SetTextureCollectTestClock(&TextureTestClockNow);
+        detail::SetTextureCollectTimingOverride(&enabled);
+    }
+    ~TextureTimingHooks() {
+        detail::SetTextureCollectTimingOverride(nullptr);
+        detail::SetTextureCollectTestClock(nullptr);
+    }
+};
+
+void CheckTimingGateOffTakesNoClock() {
+    TextureTimingHooks off;
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto walked = CollectWrites(address, Page);
+    const auto empty = CollectWrites(address, 0);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(walked != 0 && empty == 0, "the off gate changed the scoped collect's outcome");
+    Require(stats.calls == 2 && stats.walkAttempted == 1 && stats.earlyExitPreWalk == 1, "the off gate changed the outcome partition");
+    Require(stats.nsMemoHit == 0 && stats.nsWalk == 0 && stats.nsEarlyExit == 0, "the off gate accumulated a timing bucket");
+    Require(textureTestClock.readings == 0, "the off gate took a clock reading");
+    Require(stats.collectClockViolations == 0, "the off gate counted a clock violation");
+}
+
+void CheckTimingBucketsPerReturnCategory() {
+    TextureTimingHooks on(true);
+    textureTestClock.step = 1000;
+    BumpCollectEpoch();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto probe = Base + 92 * Block + 4 * Page + 64;
+    EnterTextureCollectScope();
+    const auto before = TrackerGeneration();
+    Store(probe);
+    const auto walked = CollectWrites(address, 2 * Page);
+    const auto memoized = CollectWrites(address, 2 * Page);
+    const auto empty = CollectWrites(address, 0);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(walked != 0 && memoized != 0 && empty == 0, "the on gate changed the scoped collect's outcome");
+    Require(!UnchangedSince(probe & ~(Page - 1), Page, before), "the on gate changed the scoped collect's write watch behaviour");
+    Require(stats.calls == 3, "the on gate miscounted the scoped calls");
+    Require(stats.walkAttempted == 1 && stats.memoHits == 1 && stats.earlyExitPreWalk == 1, "the on gate changed the outcome partition");
+    Require(stats.calls == stats.earlyExitPreWalk + stats.memoHits + stats.walkAttempted, "the partition does not hold with timing on");
+    Require(stats.nsWalk == 1000, "the walk was not timed in its own bucket");
+    Require(stats.nsMemoHit == 1000, "the memo hit was not timed in its own bucket");
+    Require(stats.nsEarlyExit == 1000, "the early exit was not timed in its own bucket");
+    Require(stats.collectClockViolations == 0, "a monotonic test clock raised a violation");
+    Require(textureTestClock.readings == 6, "the on gate did not read the clock twice per call");
+}
+
+void CheckTimingTakeResetsBuckets() {
+    TextureTimingHooks on(true);
+    textureTestClock.step = 500;
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    Require(CollectWrites(Base + 93 * Block + 3 * Page, Page) != 0, "the scoped collect with timing on failed");
+    const auto first = TakeTextureCollectStats();
+    const auto second = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(first.calls == 1 && first.nsWalk == 500, "the first take lost the timing bucket");
+    Require(second.calls == 0 && second.nsWalk == 0, "the take did not reset the timing buckets");
+}
+
+void CheckTimingClockViolation() {
+    TextureTimingHooks on(true);
+    textureTestClock.retrogradeSoon = true;
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    const auto empty = CollectWrites(Base + 92 * Block + 3 * Page + 100, 0);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(empty == 0, "a retrograde clock changed the scoped early exit's return");
+    Require(stats.calls == 1 && stats.earlyExitPreWalk == 1, "a retrograde clock changed the outcome partition");
+    Require(stats.collectClockViolations == 1, "a retrograde clock was not counted");
+    Require(stats.nsEarlyExit == 0, "a retrograde clock leaked time into a bucket");
+}
+
+void CheckTimingNestedScopeAccumulates() {
+    TextureTimingHooks on(true);
+    textureTestClock.step = 250;
+    BumpCollectEpoch();
+    EnterTextureCollectScope();
+    Require(CollectWrites(Base + 94 * Block + 3 * Page, Page) != 0, "the first scoped collect with timing failed");
+    EnterTextureCollectScope();
+    const auto nested = TakeTextureCollectStats();
+    Require(nested.calls == 1 && nested.nsWalk == 250, "a second enter reset the accumulated timing buckets");
+    // A different block: the first walk's block-widened memo entry must not cover this range,
+    // so the nested call really walks rather than memo-hitting.
+    Require(CollectWrites(Base + 95 * Block + 5 * Page, Page) != 0, "the scoped collect while the depth was two failed");
+    LeaveTextureCollectScope();
+    const auto outer = TakeTextureCollectStats();
+    const auto after = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(outer.calls == 1 && outer.nsWalk == 250, "the take while the depth was two misattributed the timing buckets");
+    Require(after.calls == 0 && after.nsWalk == 0, "the timing buckets survived the take while the depth was two");
+}
+
+// FT17-L: a memo probe whose mapping recheck mismatches must fall through without claiming a
+// TLS memo-hit outcome, leaving the call's single terminal counters and timing bucket coherent
+// with the partition. Each check first proves its probe path is live (a real memo hit), then
+// arms the one-shot recheck mismatch. Single thread, no real mapping mutation: the seam below
+// only replaces the recheck read, and restores it on scope exit.
+std::uint64_t RecheckMismatchedMapping() {
+    // A value the guest allocation-generation counter never takes in a test run, so the
+    // recheck fails while the seam is armed; the real mapping is never touched.
+    return ~std::uint64_t{0};
+}
+
+struct CollectRecheckSeam {
+    CollectRecheckSeam() { detail::SetCollectRecheckMappingOverride(&RecheckMismatchedMapping); }
+    ~CollectRecheckSeam() { detail::SetCollectRecheckMappingOverride(nullptr); }
+};
+
+void CheckRecheckMissFallsThroughEpochMap() {
+    BumpCollectEpoch();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto probe = Base + 92 * Block + 4 * Page + 64;
+    Store(probe);
+    Require(CollectWrites(address, Page) != 0, "the priming collect failed");
+    TextureTimingHooks on(true);
+    textureTestClock.step = 1000;
+    EnterTextureCollectScope();
+    const auto memoized = CollectWrites(address, Page);
+    const auto hit = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(memoized != 0, "the memoized collect failed");
+    Require(hit.calls == 1 && hit.memoHits == 1 && hit.memoHitEpochMap == 1, "the epoch-map probe was not the live memo path");
+    Require(hit.nsMemoHit == 1000, "the memo-hit bucket was not timed");
+    CollectRecheckSeam seam;
+    EnterTextureCollectScope();
+    const auto collected = CollectWrites(address, Page);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(collected != 0, "the recheck-mismatched collect failed");
+    Require(stats.calls == 1, "the recheck-mismatched collect miscounted its calls");
+    Require(stats.memoHits == 0 && stats.memoHitEpochMap == 0 && stats.memoHitThread == 0 && stats.memoHitShared == 0,
+            "a failed epoch-map probe claimed a TLS memo-hit outcome");
+    Require(stats.walkAttempted == 1 && stats.walkFailed == 0, "the failed epoch-map probe did not fall through to a walk");
+    Require(stats.calls == stats.earlyExitPreWalk + stats.memoHits + stats.walkAttempted, "the recheck-mismatched partition does not hold");
+    Require(stats.nsWalk == 1000 && stats.nsMemoHit == 0, "the timing bucket went to the memo probe instead of the real walk terminal");
+    Require(stats.collectClockViolations == 0, "the recheck mismatch raised a clock violation");
+}
+
+void CheckRecheckMissFallsThroughThreadMemo() {
+    // Same setup as the epoch-map check, but this process runs with the epoch collect map
+    // disabled (see --recheck-thread in main), so the probe can only come from the per-thread
+    // memo ring: the R4 recheck is exercised on its own.
+    BumpCollectEpoch();
+    const auto address = Base + 92 * Block + 3 * Page + 100;
+    const auto probe = Base + 92 * Block + 4 * Page + 64;
+    Store(probe);
+    Require(CollectWrites(address, Page) != 0, "the priming collect failed");
+    TextureTimingHooks on(true);
+    textureTestClock.step = 1000;
+    EnterTextureCollectScope();
+    const auto memoized = CollectWrites(address, Page);
+    const auto hit = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(memoized != 0, "the memoized collect failed");
+    Require(hit.calls == 1 && hit.memoHits == 1 && hit.memoHitThread == 1, "the thread-memo probe was not the live memo path");
+    Require(hit.nsMemoHit == 1000, "the memo-hit bucket was not timed");
+    CollectRecheckSeam seam;
+    EnterTextureCollectScope();
+    const auto collected = CollectWrites(address, Page);
+    const auto stats = TakeTextureCollectStats();
+    LeaveTextureCollectScope();
+    Require(collected != 0, "the recheck-mismatched collect failed");
+    Require(stats.calls == 1, "the recheck-mismatched collect miscounted its calls");
+    Require(stats.memoHits == 0 && stats.memoHitThread == 0, "a failed thread-memo probe claimed a TLS memo-hit outcome");
+    Require(stats.walkAttempted == 1 && stats.walkFailed == 0, "the failed thread-memo probe did not fall through to a walk");
+    Require(stats.calls == stats.earlyExitPreWalk + stats.memoHits + stats.walkAttempted, "the recheck-mismatched partition does not hold");
+    Require(stats.nsWalk == 1000 && stats.nsMemoHit == 0, "the timing bucket went to the memo probe instead of the real walk terminal");
+    Require(stats.collectClockViolations == 0, "the recheck mismatch raised a clock violation");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        // The epoch collect map enablement is read once per process (function-local static in
+        // GuestMemory.cpp): disabling it here, before the first collect, selects the R4
+        // thread-memo probe path for this whole run.
+        if (argc == 2 && std::string(argv[1]) == "--recheck-thread") {
+            // _putenv (not SetEnvironmentVariable): the CRT's getenv, which the memo helpers
+            // read their static config from, only follows the CRT environment.
+            _putenv("APS5_NO_EPOCH_COLLECT_MAP=1");
+        }
 #ifdef _WIN32
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";
@@ -339,6 +674,8 @@ int main(int argc, char** argv) {
             } else if (selected == "--invalidation") {
                 CheckCoverageGapsAndInvalidations();
                 CheckCoverageThreadAndDriverWrites();
+            } else if (selected == "--recheck-thread") {
+                CheckRecheckMissFallsThroughThreadMemo();
             } else throw std::runtime_error("unknown collect coverage test");
             std::cout << "collect coverage test passed\n";
             return 0;
@@ -349,6 +686,19 @@ int main(int argc, char** argv) {
         CheckInvalidationReachesBlockKeyedEntry();
         CheckThreadWithoutEpochWalksEveryTime();
         CheckStoreInNewEpochIsFound();
+        CheckScopePartitionWalkThenMemo();
+        CheckScopeEarlyExit();
+        CheckTakeResetsScopeStats();
+        CheckUnscopedCallsDoNotContaminate();
+        CheckScopeStatsAreThreadLocal();
+        CheckScopedCollectMatchesUnscoped();
+        CheckNestedScopeTake();
+        CheckTimingGateOffTakesNoClock();
+        CheckTimingBucketsPerReturnCategory();
+        CheckTimingTakeResetsBuckets();
+        CheckTimingClockViolation();
+        CheckTimingNestedScopeAccumulates();
+        CheckRecheckMissFallsThroughEpochMap();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;
