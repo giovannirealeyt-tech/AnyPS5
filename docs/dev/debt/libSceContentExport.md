@@ -11,6 +11,8 @@
 
 - [sceContentExportTerm](../../../core/libs/prx/libSceContentExport/Export.cpp) (libSceContentExport) returns 0 without waiting for ongoing operations, tearing down threads, or verifying that all resources have been released.
 
+- [sceContentExportInit2](../../../core/libs/prx/libSceContentExport/Export.cpp) (libSceContentExport) - throwing std::invalid_argument for unmapped or unreadable parameter pointers is a host-safety fallback; whether console hardware faults or returns an argument error on unmapped memory is unmeasured.
+
 ### Unknown function info
 
 - PlayStation 5 firmware exports declared without parameters, signatures unknown: [sceContentExportAddToFavorites, sceContentExportDataProvideFunction, sceContentExportFree, sceContentExportFrom, sceContentExportFromFileForSf, sceContentExportFromFileWithContentIdList, sceContentExportFromFileWithTitleIdList, sceContentExportInit, sceContentExportMalloc, sceContentExportRemoveFromFavorites, sceContentExportRenameContent, sceContentExportValidateContents](../../../core/libs/prx/libSceContentExport/Export.cpp) (libSceContentExport). Names from the firmware NID database; unimplemented and throw `NotImplemented_nid_no_patch`.
