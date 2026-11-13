@@ -1345,6 +1345,12 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/BlsLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ShiftLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/BitfieldLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/CountLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/MovbeLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/Avx2TwinLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/LaneSplitLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/PermuteLowering.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/WidenBroadcastLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/SegmentFilter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/general/TrampolineWriter.cpp
