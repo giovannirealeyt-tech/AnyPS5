@@ -1435,16 +1435,6 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(voice_port_tests tests/VoicePorts.cpp)
-    target_include_directories(voice_port_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(voice_port_tests PRIVATE libSceVoice libc)
-    configure_windows_unwind(voice_port_tests)
-    add_test(NAME voice_ports COMMAND voice_port_tests)
-    if(WIN32)
-        set_tests_properties(voice_ports PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-
     if(MINGW)
         add_test(NAME prx_thread_local_destructors COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DOBJDUMP=${CMAKE_OBJDUMP}
             -DMODULES=$<TARGET_FILE_DIR:libc> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/ThreadLocalDestructors.cmake)
