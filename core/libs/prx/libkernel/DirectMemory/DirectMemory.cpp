@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cwctype>
 #include <memory>
+#include <new>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -217,21 +218,6 @@ static void MapUnmappedPages(void* addr, size_t len) {
 namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
-constexpr int GuestMapNoOverwriteFlag = 0x80;
-constexpr int GuestMapNoCoalesceFlag = 0x400000;
-constexpr int ObservedFlexibleMappingFlag = 0x8000;
-
-constexpr int SupportedMapFlags() {
-#if defined(__linux__) || defined(_WIN32)
-    return GuestMapFixedFlag | GuestMapNoOverwriteFlag | GuestMapNoCoalesceFlag;
-#else
-    return GuestMapFixedFlag | GuestMapNoCoalesceFlag;
-#endif
-}
-
-bool HasUnsupportedMapFlags(int flags, int additionalSupportedFlags = 0) {
-    return (flags & ~(SupportedMapFlags() | additionalSupportedFlags)) != 0;
-}
 constexpr int GuestProtGpuReadWrite = 0x30;
 constexpr int GuestProtCpuExecute = 0x4;
 
@@ -379,6 +365,55 @@ void ZeroReusedPhysical(std::uint64_t start, std::size_t bytes) {
 }
 #endif
 
+#ifdef _WIN32
+bool SectionPoolEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DIRECT_MEMORY_SECTION_POOL") == nullptr;
+    return enabled;
+}
+
+class SectionPool {
+public:
+    static SectionPool& Get() {
+        static auto* pool = new SectionPool;
+        return *pool;
+    }
+
+    HANDLE Take(std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto found = sections.find(bytes);
+        if (found == sections.end() || found->second.empty()) return nullptr;
+        const auto section = found->second.back();
+        found->second.pop_back();
+        --count;
+        pooledBytes -= bytes;
+        return section;
+    }
+
+    bool Keep(HANDLE section, std::size_t bytes) noexcept {
+        if (bytes > MaxSectionBytes) return false;
+        std::lock_guard lock(mutex);
+        if (count == MaxSections || bytes > MaxPooledBytes - pooledBytes) return false;
+        try {
+            sections[bytes].push_back(section);
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        ++count;
+        pooledBytes += bytes;
+        return true;
+    }
+
+private:
+    static constexpr std::size_t MaxSections = 256;
+    static constexpr std::size_t MaxSectionBytes = 16u << 20;
+    static constexpr std::size_t MaxPooledBytes = 256u << 20;
+    std::mutex mutex;
+    std::map<std::size_t, std::vector<HANDLE>> sections;
+    std::size_t count = 0;
+    std::size_t pooledBytes = 0;
+};
+#endif
+
 class PhysicalBacking {
 public:
     PhysicalBacking(std::size_t bytes, int memoryType, std::uint64_t start) : memoryType(memoryType), bytes(bytes) {
@@ -387,7 +422,8 @@ public:
 #elif defined(_WIN32)
         static_cast<void>(start);
         const auto size = static_cast<std::uint64_t>(bytes);
-        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
+        if (SectionPoolEnabled()) section = SectionPool::Get().Take(bytes);
+        if (!section) section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
         if (!section) {
             const auto error = static_cast<int>(GetLastError());
             char message[96];
@@ -425,8 +461,12 @@ public:
     ~PhysicalBacking() {
 #if defined(__EMSCRIPTEN__)
 #elif defined(_WIN32)
-        GuestArena::GuestArenaForgetSection_nid_postfix(section);
-        CloseHandle(section);
+        if (!SectionPoolEnabled()) {
+            GuestArena::GuestArenaForgetSection_nid_postfix(section);
+            CloseHandle(section);
+        } else if (!GuestArena::GuestArenaForgetReusableSection_nid_no_patch(section) || !SectionPool::Get().Keep(section, bytes)) {
+            CloseHandle(section);
+        }
 #elif defined(__APPLE__)
         mach_port_deallocate(mach_task_self(), entry);
 #else
@@ -801,7 +841,8 @@ void RequireAliasesUnpinned(GuestAllocations::Mutation& mutation, std::uint64_t 
     std::vector<std::pair<std::uintptr_t, std::size_t>> aliases;
     {
         std::lock_guard lock(g_directLock);
-        for (const auto& [base, mapping] : g_directMappings) {
+        for (const auto base : MappingsSharingPhys(phys, phys + len)) {
+            const auto& mapping = g_directMappings.at(base);
             const auto first = std::max(phys, mapping.phys);
             const auto last = std::min(phys + len, mapping.phys + (mapping.end - base));
             if (first < last) aliases.emplace_back(base + (first - mapping.phys), last - first);
@@ -887,19 +928,22 @@ void Unmap(void* addr, size_t len) {
 #endif
 }
 
-void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment, int additionalSupportedFlags = 0) {
+void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     ValidateLength(len);
     alignment = ValidateAlignment(alignment);
-    if (HasUnsupportedMapFlags(flags, additionalSupportedFlags)) {
+    constexpr int GuestMapFixed = 0x10;
+    constexpr int GuestMapNoOverwrite = 0x80;
+    constexpr int GuestMapNoCoalesce = 0x400000;
+    constexpr int SupportedFlags = GuestMapFixed | GuestMapNoOverwrite | GuestMapNoCoalesce;
+    if ((flags & ~SupportedFlags) != 0) {
         char message[64];
         std::snprintf(message, sizeof(message), "Unsupported memory mapping flags 0x%x", flags);
         throw std::invalid_argument(message);
     }
-    flags &= ~additionalSupportedFlags;
-    if ((flags & GuestMapFixedFlag) != 0) {
+    if ((flags & GuestMapFixed) != 0) {
         ValidateRange(addr, len, alignment);
 #ifdef _WIN32
-        if ((flags & GuestMapNoOverwriteFlag) != 0) {
+        if ((flags & GuestMapNoOverwrite) != 0) {
             const auto start = reinterpret_cast<std::uintptr_t>(addr);
             auto cursor = start;
             while (cursor - start < len) {
@@ -935,10 +979,10 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment, i
         }
 #endif
 #if defined(__linux__) || defined(__EMSCRIPTEN__)
-        const int placement = (flags & GuestMapNoOverwriteFlag) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
+        const int placement = (flags & GuestMapNoOverwrite) != 0 ? MAP_FIXED_NOREPLACE : MAP_FIXED;
         void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | placement, -1, 0);
 #elif defined(__APPLE__)
-        void* result = (flags & GuestMapNoOverwriteFlag) != 0 ? MapFixedNoReplace(addr, len, prot) : mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        void* result = (flags & GuestMapNoOverwrite) != 0 ? MapFixedNoReplace(addr, len, prot) : mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #else
         void* result = mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #endif
@@ -1051,8 +1095,8 @@ void RecordProtection(const void* addr, size_t len, int prot) {
     if (prot >= 0) g_protections.emplace(start, ProtectedRange{start + len, ReportedProtection(prot)});
 }
 
-void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment, int additionalSupportedFlags = 0) {
-    void* mapped = MapPlaced(addr, len, prot, flags, alignment, additionalSupportedFlags);
+void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
+    void* mapped = MapPlaced(addr, len, prot, flags, alignment);
 #if defined(__linux__) || defined(__APPLE__)
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(mapped, len);
 #endif
@@ -1118,11 +1162,10 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
     return flags | GuestMapFixedFlag;
 }
 
-int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) try {
+int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     ValidateAlignment(alignment);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
-    if (HasUnsupportedMapFlags(flags)) return SCE_KERNEL_ERROR_EINVAL;
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
@@ -1158,15 +1201,9 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     RecordProtection(mapped, len, prot);
     Trace("map direct %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", mapped, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
     return 0;
-} catch (const std::invalid_argument& error) {
-    const char* trace = std::getenv("APS5_TRACE_DIRECT_ERRORS");
-    if (trace != nullptr && std::strcmp(trace, "1") == 0) {
-        std::fprintf(stderr, "[memory-error] map direct phys=0x%llx len=0x%zx: %s\n", static_cast<unsigned long long>(physStart), len, error.what());
-    }
-    return SCE_KERNEL_ERROR_EINVAL;
 }
 
-static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, bool zero, int additionalSupportedFlags = 0) {
+static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, bool zero) {
     GuestAllocations::Mutation mutation;
     if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
@@ -1177,7 +1214,7 @@ static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t ali
         return 0;
     }
     ReplaceFixedOverlap(mutation, *addr, len, flags);
-    void* mapped = MapAligned(*addr, len, zero ? PROT_NONE : LinuxProtFromSce(prot), flags, alignment, additionalSupportedFlags);
+    void* mapped = MapAligned(*addr, len, zero ? PROT_NONE : LinuxProtFromSce(prot), flags, alignment);
     try {
 #ifdef _WIN32
         if (zero) GuestArena::GuestArenaMapZero_nid_postfix(mapped, len);
@@ -1198,7 +1235,6 @@ static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t ali
 int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, [[maybe_unused]] bool allowStackReplacement) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
-    if (HasUnsupportedMapFlags(flags, ObservedFlexibleMappingFlag)) return SCE_KERNEL_ERROR_EINVAL;
 #ifdef _WIN32
     if (allowStackReplacement && (flags & GuestMapFixedFlag) != 0 && !KernelArena::Get().Owns(*addr, len)) {
         constexpr int GuestMapNoOverwrite = 0x80;
@@ -1246,7 +1282,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bo
         return result;
     }
 #endif
-    return MapAnonymous(addr, len, prot, flags, alignment, exclusive, false, ObservedFlexibleMappingFlag);
+    return MapAnonymous(addr, len, prot, flags, alignment, exclusive, false);
 }
 
 int DoMapZero(void** addr, size_t len, int prot, int flags) {
@@ -1263,7 +1299,7 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
 int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, int descriptor, std::uint64_t offset, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || (offset & (PS5_PAGE_SIZE - 1)) != 0 || len > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) || offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - len) return SCE_KERNEL_ERROR_EINVAL;
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     const bool shared = (flags & 3) == 1;
     GuestAllocations::Mutation mutation;
     const int placementFlags = flags & (GuestMapFixedFlag | 0x80 | 0x400000);
@@ -1274,10 +1310,20 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(mapped, len);
     const int nativeProtection = LinuxProtFromSce(prot);
     const int nativeFlags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED;
-    if (::mmap(mapped, len, nativeProtection, nativeFlags, descriptor, static_cast<off_t>(offset)) == MAP_FAILED) {
+#ifdef __APPLE__
+    const int mappedProtection = nativeProtection & ~PROT_EXEC;
+#else
+    const int mappedProtection = nativeProtection;
+#endif
+    if (::mmap(mapped, len, mappedProtection, nativeFlags, descriptor, static_cast<off_t>(offset)) == MAP_FAILED) {
         const int error = errno;
         Unmap(mapped, len);
         throw std::system_error(error, std::generic_category(), "map guest shared memory");
+    }
+    if (mappedProtection != nativeProtection && ::mprotect(mapped, len, nativeProtection) != 0) {
+        const int error = errno;
+        Unmap(mapped, len);
+        throw std::system_error(error, std::generic_category(), "make a guest file mapping executable");
     }
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
@@ -1582,20 +1628,38 @@ int DoMunmap(void* addr, size_t len) {
 int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
-    const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
     GuestAllocations::Mutation mutation;
-    if (fixed && mutation.Covers(*addr, len)) {
-        constexpr int GuestMapNoOverwrite = 0x80;
-        if ((flags & GuestMapNoOverwrite) == 0 && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
-            RecordProtection(*addr, len, -1);
-            RecordReservation(*addr, len);
-            return 0;
+    const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
+    if (fixed) {
+        if (GuestArena::GuestArenaAvailable_nid_postfix() && !GuestArena::GuestArenaContains_nid_postfix(*addr, len)) return SCE_KERNEL_ERROR_EINVAL;
+        if (FixedNoOverwriteConflict(mutation, *addr, len, flags)) return SCE_KERNEL_ERROR_ENOMEM;
+        if (mutation.Covers(*addr, len)) {
+            constexpr int GuestMapNoOverwrite = 0x80;
+            if ((flags & GuestMapNoOverwrite) == 0 && RemapFixedIntoRegistered(mutation, *addr, len, 0, GuestMapFixedFlag)) {
+                RecordProtection(*addr, len, -1);
+                RecordReservation(*addr, len);
+                return 0;
+            }
         }
         mutation.RequireAvailable(*addr, len);
+        std::uintptr_t usedStart = 0, usedEnd = 0;
+        if (GuestArena::GuestArenaAvailable_nid_postfix() &&
+            GuestArena::GuestArenaNextUsed_nid_no_patch(reinterpret_cast<std::uintptr_t>(*addr), &usedStart, &usedEnd) &&
+            usedStart < reinterpret_cast<std::uintptr_t>(*addr) + len && reinterpret_cast<std::uintptr_t>(*addr) < usedEnd) {
+            return SCE_KERNEL_ERROR_ENOMEM;
+        }
     }
-    if (fixed) mutation.RequireAvailable(*addr, len);
     constexpr int GuestMapNoCoalesce = 0x400000;
-    void* mapped = MapAligned(*addr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
+    void* mapped = nullptr;
+    if (fixed) {
+        try {
+            mapped = MapAligned(*addr, len, PROT_NONE, GuestMapFixedFlag | (flags & GuestMapNoCoalesce), alignment);
+        } catch (const std::invalid_argument&) {
+            return SCE_KERNEL_ERROR_EINVAL;
+        }
+    } else {
+        mapped = MapAligned(*addr, len, PROT_NONE, 0, alignment);
+    }
     try {
         mutation.Add(mapped, len, false, false, false);
     } catch (...) {

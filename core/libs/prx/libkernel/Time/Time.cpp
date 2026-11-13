@@ -314,8 +314,7 @@ void sceKernelTraceWaitsFocus_nid_postfix(unsigned long thread) {
 }
 
 void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint64_t waitedNanos, bool timedOut) {
-    static const bool enabled = std::getenv("APS5_TRACE_WAITS") != nullptr;
-    if (!enabled) return;
+    if (!KernelTraceWaitEnabled()) return;
     // APS5_TRACE_WAITS_TID: key each site by the calling OS thread, and label each report with its
     // process-relative window. Off by default: the key and the line format stay as before.
     static const bool perThread = std::getenv("APS5_TRACE_WAITS_TID") != nullptr;

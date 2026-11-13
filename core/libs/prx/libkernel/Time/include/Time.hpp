@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBKERNEL_TIME_INCLUDE_TIME_HPP
 
 #include <cstdint>
+#include <cstdlib>
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 
@@ -32,6 +33,11 @@ extern "C" {
     // waits only. 0 restores the whole-process report. Only meaningful with APS5_TRACE_WAITS set.
     void sceKernelTraceWaitsFocus_nid_postfix(unsigned long thread);
 
+}
+
+inline bool KernelTraceWaitEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACE_WAITS") != nullptr;
+    return enabled;
 }
 
 #endif
