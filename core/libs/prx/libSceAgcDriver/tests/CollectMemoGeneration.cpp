@@ -916,6 +916,7 @@ void CheckRecheckMissFallsThroughThreadMemo() {
     Require(stats.calls == stats.earlyExitPreWalk + stats.memoHits + stats.walkAttempted, "the recheck-mismatched partition does not hold");
     Require(stats.nsWalk == 1000 && stats.nsMemoHit == 0, "the timing bucket went to the memo probe instead of the real walk terminal");
     Require(stats.collectClockViolations == 0, "the recheck mismatch raised a clock violation");
+}
 
 template <typename Body>
 void OnThread(Body body) {

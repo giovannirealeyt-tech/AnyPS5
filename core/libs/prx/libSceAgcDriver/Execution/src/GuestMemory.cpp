@@ -2336,7 +2336,6 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         if (textureScope) textureCollectStatsTls.earlyExitPreWalk++;
         return finish(CollectTiming::EarlyExit, Observation{Status::Uncovered, 0});
     }
-    }
 
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
@@ -4327,8 +4326,10 @@ std::uint32_t ChangedByteStoreLimit() {
 #endif
 }
 
+static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit, bool keepGuest);
+
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
-    WriteChanged(address, current, original, ChangedByteStoreLimit());
+    writeChanged(address, current, original, ChangedByteStoreLimit(), false);
 }
 
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
