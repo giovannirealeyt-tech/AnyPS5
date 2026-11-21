@@ -54,6 +54,7 @@ struct DispatchVariant {
     std::array<std::uint32_t, 4> meshIndexDescriptor{};
 
     std::shared_ptr<const ShaderSnapshot> shader;
+    std::shared_ptr<const PreparedShaderState::UserDataLink> linking;
 
     AtomicSharedPtr<const Recipe> recipe;
 

@@ -9,8 +9,10 @@
 #include "prx/libkernel/File/include/HostStreams.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -676,6 +678,25 @@ int KernelEqueuePrivate::WaitForEventsUntil(KernelEvent* ev, int num, std::uint6
     }
 }
 
+void KernelEqueuePrivate::NoteDroppedPendingEvents(std::size_t dropped, const KernelEqueueEvent& ev) {
+    if (dropped == 0) {
+        return;
+    }
+    const auto before = m_droppedPendingEvents;
+    m_droppedPendingEvents += dropped;
+    static const bool trace = std::getenv("APS5_TRACE_EQUEUE") != nullptr;
+    if (!trace) {
+        return;
+    }
+    if (before != 0 && std::bit_width(m_droppedPendingEvents) == std::bit_width(before)) {
+        return;
+    }
+    std::fprintf(stderr,
+        "[equeue] %s: dropped %zu oldest pending event(s) for ident=0x%llx filter=%d past cap=%zu (total dropped %llu)\n",
+        m_name.c_str(), dropped, static_cast<unsigned long long>(ev.event.ident), static_cast<int>(ev.event.filter),
+        kMaxPendingEvents, static_cast<unsigned long long>(m_droppedPendingEvents));
+}
+
 int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
     std::unique_lock lock(m_mutex);
     if (m_closed) {
@@ -697,9 +718,11 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
             pending.udata = event.event.udata;
         }
         if (it->pendingEvents.size() > kMaxPendingEvents) {
+            NoteDroppedPendingEvents(it->pendingEvents.size() - kMaxPendingEvents, *it);
             it->pendingEvents.erase(it->pendingEvents.begin(), it->pendingEvents.begin() + static_cast<std::deque<KernelEvent>::difference_type>(it->pendingEvents.size() - kMaxPendingEvents));
         }
     } else if (event.pendingEvents.size() > kMaxPendingEvents) {
+        NoteDroppedPendingEvents(event.pendingEvents.size() - kMaxPendingEvents, event);
         KernelEqueueEvent truncated;
         truncated.triggered = event.triggered;
         truncated.enabled = event.enabled;
@@ -715,11 +738,11 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
         m_events.push_back(event);
         if (event.triggered) ++m_activations;
     }
-    if (event.triggered && EqueueIdentityEnabled()) {
+if (event.triggered && EqueueIdentityEnabled()) {
         const void* const site = t_equeueProducerSite != nullptr ? t_equeueProducerSite : __builtin_return_address(0);
         IdentityProducer(m_handle, event.event.filter, event.event.ident, event.event.udata, site);
     }
-    m_cond.NotifyOne();
+    m_cond.NotifyAll();
     WakePollers();
     return EQUEUE_OK;
 }
@@ -745,15 +768,19 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
             it->triggered = true;
         }
         if (it->pendingEvents.size() > KernelEqueuePrivate::kMaxPendingEvents) {
+            NoteDroppedPendingEvents(it->pendingEvents.size() - KernelEqueuePrivate::kMaxPendingEvents, *it);
             it->pendingEvents.erase(it->pendingEvents.begin(), it->pendingEvents.begin() + static_cast<std::deque<KernelEvent>::difference_type>(it->pendingEvents.size() - KernelEqueuePrivate::kMaxPendingEvents));
         }
-        if (!was && it->triggered) ++m_activations;
+if (!was && it->triggered) {
+            ++m_activations;
+            if (filter == EVFILT_USER) m_events.splice(m_events.end(), m_events, it);
+        }
         if (EqueueIdentityEnabled()) {
             const void* const site = t_equeueProducerSite != nullptr ? t_equeueProducerSite : __builtin_return_address(0);
             IdentityProducer(m_handle, filter, ident, it->event.udata, site);
         }
     }
-    m_cond.NotifyOne();
+    m_cond.NotifyAll();
     WakePollers();
     return EQUEUE_OK;
 }
@@ -790,7 +817,7 @@ int KernelEqueuePrivate::EditEvent(uintptr_t ident, int16_t filter, const std::f
         }
     } activation{*this, *it, it->enabled && it->triggered};
     edit(*it);
-    m_cond.NotifyOne();
+    m_cond.NotifyAll();
     WakePollers();
     return EQUEUE_OK;
 }
@@ -916,18 +943,25 @@ int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq) {
 }
 
 int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out, const KernelUseconds* timo) {
+    const auto fail = [out](int error) {
+        if (out != nullptr) *out = 0;
+        return error;
+    };
+    if (num < 1) {
+        return fail(SCE_KERNEL_ERROR_EINVAL);
+    }
     auto owner = EqueuePin_nid_postfix(eq);
     if (!owner) {
-        return SCE_KERNEL_ERROR_EBADF;
+        return fail(SCE_KERNEL_ERROR_EBADF);
     }
     if (ev == nullptr) {
-        return SCE_KERNEL_ERROR_EFAULT;
+        return fail(SCE_KERNEL_ERROR_EFAULT);
     }
-    if (num < 1 || out == nullptr) {
+    if (out == nullptr) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
     const auto waitStart = std::chrono::steady_clock::now();
-    const bool identity = EqueueIdentityEnabled();
+const bool identity = EqueueIdentityEnabled();
     const std::uint64_t identityStartNs = identity ? KernelEqueuePrivate::MonotonicNs() : 0;
     const int identityWaitToken = identity
         ? IdentityWaitEnter(eq, identityStartNs, EqueueIdentityProcNs(), EqueueIdentityThreadId(),
@@ -936,13 +970,14 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
     // The probe accounting identity waits = prod + noprod + empty + err requires every entered wait
     // to close exactly once. The wait can unwind (for example a socket path throwing on a descriptor
     // that is not a socket), so the catch-all closes it as an error before rethrowing.
+    int result = 0;
     try {
         if (timo == nullptr) {
-            *out = owner->WaitForEvents(ev, num, 0);
+            result = owner->WaitForEvents(ev, num, 0);
         } else if (*timo == 0) {
-            *out = owner->GetTriggeredEvents(ev, num);
+            result = owner->GetTriggeredEvents(ev, num);
         } else {
-            *out = owner->WaitForEvents(ev, num, *timo);
+            result = owner->WaitForEvents(ev, num, *timo);
         }
     } catch (...) {
         if (identity) {
@@ -954,16 +989,17 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
     }
     if (identity) {
         const std::uint64_t endNs = KernelEqueuePrivate::MonotonicNs();
-        IdentityWaitExit(eq, identityWaitToken, endNs, EqueueIdentityProcNs(), *out);
+        IdentityWaitExit(eq, identityWaitToken, endNs, EqueueIdentityProcNs(), result);
         MaybeReportEqueueIdentity(eq, endNs, EqueueIdentityProcNs());
     }
     if (timo == nullptr || *timo != 0) {
-        KernelTraceWait_nid_postfix("equeue", __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), *out == 0);
+        KernelTraceWait_nid_postfix("equeue", __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), result == 0);
     }
-    if (*out == SCE_KERNEL_ERROR_EBADF) {
-        return SCE_KERNEL_ERROR_EBADF;
+    if (result == SCE_KERNEL_ERROR_EBADF) {
+        return fail(SCE_KERNEL_ERROR_EBADF);
     }
-    if (*out == 0) {
+    *out = result;
+    if (result == 0) {
         return SCE_KERNEL_ERROR_ETIMEDOUT;
     }
     return EQUEUE_OK;
