@@ -8,7 +8,6 @@
 #include <chrono>
 #ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstddef>
@@ -631,6 +630,10 @@ public:
         forgetZero(address, address + bytes);
     }
 
+    std::uint64_t KnownZeroMarks() const {
+        return zeroMarks.load(std::memory_order_acquire);
+    }
+
     void KnownZero(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
         const auto end = address + bytes;
@@ -933,6 +936,30 @@ public:
 private:
     using OwnedRanges = std::multimap<std::uintptr_t, std::uintptr_t>;
 
+    class Lock {
+    public:
+        Lock() : pthread(std::getenv("APS5_MAPPINGS_PTHREAD_LOCK") != nullptr) {}
+        Lock(const Lock&) = delete;
+        Lock& operator=(const Lock&) = delete;
+
+        void lock() {
+            if (pthread) fallback.lock();
+            else AcquireSRWLockExclusive(&native);
+        }
+        bool try_lock() {
+            return pthread ? fallback.try_lock() : TryAcquireSRWLockExclusive(&native) != 0;
+        }
+        void unlock() {
+            if (pthread) fallback.unlock();
+            else ReleaseSRWLockExclusive(&native);
+        }
+
+    private:
+        SRWLOCK native = SRWLOCK_INIT;
+        std::mutex fallback;
+        bool pthread;
+    };
+
     static bool ownedRange(std::uintptr_t address, std::size_t bytes, std::size_t count) {
         if (address == 0 || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return false;
         return count == ((address + bytes - 1) / ownedBlockBytes - address / ownedBlockBytes + 1);
@@ -995,6 +1022,7 @@ private:
     void markZero(std::uintptr_t start, std::uintptr_t end) {
         start = (start + 4095) & ~std::uintptr_t{4095};
         end &= ~std::uintptr_t{4095};
+        if (start >= end) return;
         while (start < end) {
             const auto chunk = start & ~(chunkBytes - 1);
             const auto stop = std::min(end, chunk + chunkBytes);
@@ -1002,6 +1030,7 @@ private:
             for (auto bit = (start - chunk) >> 12; bit < (stop - chunk) >> 12; ++bit) bits[bit >> 6] |= std::uint64_t{1} << (bit & 63);
             start = stop;
         }
+        zeroMarks.fetch_add(1, std::memory_order_release);
     }
 
     static void clearZeroBits(auto& bits, std::uintptr_t chunk, std::uintptr_t from, std::uintptr_t to) {
@@ -1830,6 +1859,7 @@ private:
 #endif
     Ranges freshRanges;
     std::unordered_map<std::uintptr_t, std::array<std::uint64_t, chunkBytes / 4096 / 64>> zeroPages;
+    std::atomic<std::uint64_t> zeroMarks{0};
     std::map<std::uintptr_t, View> views;
 
     using Views = std::map<std::uintptr_t, View>;
@@ -1853,7 +1883,7 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
     static inline std::atomic<std::uint64_t> queries{0};
 #endif
-    std::mutex mutex;
+    Lock mutex;
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
