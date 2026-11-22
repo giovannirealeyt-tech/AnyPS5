@@ -410,6 +410,29 @@ std::uint64_t EnvironmentNumber(const char* name) {
     return result;
 }
 
+// Backwards compatibility with the pre-merge inline format of APS5_PAD_SCRIPT:
+// "<start_ms>:<mask hex>:<hold_ms>;..." (e.g. "10000:4000:150;20000:4000:150").
+// The InputScript layer treats the variable as a file path; when the value is not
+// an existing file but parses as this legacy form, convert it to named buttons.
+static bool ParseLegacyPadScript(std::string_view text, std::vector<Pad::InputScript::Entry>& out) {
+    while (!text.empty()) {
+        unsigned long long startMs = 0, holdMs = 0;
+        unsigned int mask = 0;
+        int consumed = 0;
+        if (std::sscanf(text.data(), "%llu:%x:%llu%n", &startMs, &mask, &holdMs, &consumed) != 3 || consumed == 0)
+            return false;
+        Pad::InputScript::Entry entry;
+        entry.startMs = startMs;
+        entry.holdMs = holdMs != 0 ? holdMs : Pad::InputScript::kDefaultHoldMs;
+        entry.buttons = static_cast<std::uint32_t>(mask);
+        entry.label = Pad::InputScript::Describe(entry.buttons);
+        out.push_back(std::move(entry));
+        text.remove_prefix(static_cast<std::size_t>(consumed));
+        if (!text.empty() && text.front() == ';') text.remove_prefix(1);
+    }
+    return true;
+}
+
 Pad::InputScript* Script() {
     static const std::unique_ptr<Pad::InputScript> script = [] () -> std::unique_ptr<Pad::InputScript> {
 #ifdef _WIN32
@@ -424,12 +447,27 @@ Pad::InputScript* Script() {
         if (path.empty() && live.empty()) return nullptr;
         auto created = std::make_unique<Pad::InputScript>();
         if (!path.empty()) {
-            try {
-                created->SetScript(Pad::InputScript::ParseFile(path));
-            } catch (const std::runtime_error& error) {
-                std::fprintf(stderr, "%s\n", error.what());
-                std::fflush(stderr);
-                std::exit(1);
+            const auto parseFile = [&] {
+                try {
+                    created->SetScript(Pad::InputScript::ParseFile(path));
+                } catch (const std::runtime_error& error) {
+                    std::fprintf(stderr, "%s\n", error.what());
+                    std::fflush(stderr);
+                    std::exit(1);
+                }
+            };
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec)) {
+                std::vector<Pad::InputScript::Entry> entries;
+                if (ParseLegacyPadScript(path.string(), entries)) {
+                    std::fprintf(stderr, "[pad-diag] APS5_PAD_SCRIPT interpreted as legacy inline script (%zu events)\n", entries.size());
+                    std::fflush(stderr);
+                    created->SetScript(std::move(entries));
+                } else {
+                    parseFile();
+                }
+            } else {
+                parseFile();
             }
         }
         created->SetLoopMs(EnvironmentNumber("APS5_PAD_SCRIPT_LOOP_MS"));

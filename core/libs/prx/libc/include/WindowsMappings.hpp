@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
