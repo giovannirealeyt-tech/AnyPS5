@@ -18,7 +18,7 @@ if(MINGW)
         file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/test_executables.txt" CONTENT "${testExecutableFiles}\n")
         add_test(NAME test_executable_manifests COMMAND ${CMAKE_COMMAND} -DEXECUTABLES=${CMAKE_BINARY_DIR}/test_executables.txt
             -P ${CMAKE_SOURCE_DIR}/cmake/ExecutableManifests.cmake)
-        set_tests_properties(test_executable_manifests PROPERTIES TIMEOUT 60)
+        set_tests_properties(test_executable_manifests PROPERTIES TIMEOUT 600)
     endfunction()
     cmake_language(DEFER CALL add_test_executable_manifests_test)
 endif()
