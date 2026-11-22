@@ -715,7 +715,7 @@ public:
             return false;
         }
         const auto capacity = *count;
-        if (!collect(address, bytes, pages, count, clear, collection)) return false;
+        if (!collect(address, bytes, pages, count, clear, collection, subphaseOn, compareShared)) return false;
         addHostWrites(address, address + bytes, pages, count, capacity);
         return true;
     }
@@ -739,7 +739,7 @@ private:
         for (std::size_t index = 0; index < *count; ++index) pages[index] = reinterpret_cast<void*>(merged[index]);
     }
 
-    bool collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection) {
+    bool collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection, bool subphaseOn, bool compareShared) {
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
