@@ -8676,10 +8676,6 @@ int APS5_VABI WKBundleFrameCallShouldCloseOnWebView() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI WKBundleFrameClearOpener() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI WKBundleFrameCopyChildFrames() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -8725,10 +8721,6 @@ int APS5_VABI WKBundleFrameCreateFrameHandle() {
 }
 
 
-
-int APS5_VABI WKBundleFrameFocus() {
-    NotImplemented_nid_no_patch(__func__);
-}
 
 int APS5_VABI WKBundleFrameForJavaScriptContext() {
     NotImplemented_nid_no_patch(__func__);
@@ -9537,14 +9529,6 @@ int APS5_VABI WKPageCountStringMatches() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI WKPageDidAllowPointerLock() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageDidDenyPointerLock() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI WKPageEndPrinting() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9571,18 +9555,6 @@ int APS5_VABI WKPageGetAllowsRemoteInspection() {
 
 
 int APS5_VABI WKPageGetBackingScaleFactor() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGetBytecodeProfile() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGetContentsAsMHTMLData() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGetContentsAsString() {
     NotImplemented_nid_no_patch(__func__);
 }
 
@@ -9615,15 +9587,7 @@ int APS5_VABI WKPageGetProcessIdentifier() {
 }
 
 
-int APS5_VABI WKPageGetSamplingProfilerOutput() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI WKPageGetScaleFactor() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageGetSelectionAsWebArchiveData() {
     NotImplemented_nid_no_patch(__func__);
 }
 
@@ -9776,10 +9740,6 @@ int APS5_VABI WKPageReload() {
 }
 
 int APS5_VABI WKPageReloadWithoutContentBlockers() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageRenderTreeExternalRepresentation() {
     NotImplemented_nid_no_patch(__func__);
 }
 

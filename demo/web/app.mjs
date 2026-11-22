@@ -159,7 +159,7 @@ function renderError() {
   }
 }
 
-async function fail(value) {
+async function fail(value, { keepInspection = false } = {}) {
   if (failing) return;
   failing = true;
   errorState = {
@@ -173,6 +173,15 @@ async function fail(value) {
       log: logs
     }
   };
+  if (keepInspection) {
+    $("error").hidden = false;
+    $("cancel").hidden = true;
+    working = false;
+    failing = false;
+    lock(false);
+    update();
+    return;
+  }
   releaseVersion++;
   releaseRequest = null;
   worker?.terminate();
@@ -284,6 +293,7 @@ async function onMessage({ data }, currentWorker) {
       await sink.write(data.bytes);
       if (currentWorker === worker) currentWorker.postMessage({ type: "written" });
     } else if (data.type === "complete") {
+      const focusDownload = data.blob && document.activeElement === $("cancel");
       $("cancel").hidden = true;
       if (sink) {
         await sink.close();
@@ -320,6 +330,7 @@ async function onMessage({ data }, currentWorker) {
       worker = null;
       lock(false);
       update();
+      if (focusDownload) $("download").focus();
     } else if (data.type === "error") await fail(data.message);
   } catch (error) {
     if (currentWorker === worker) await fail(error);
@@ -424,7 +435,9 @@ async function createZipSink(name, current) {
 $("convert").onclick = async () => {
   if ($("convert").disabled) return;
   const currentWorker = worker;
+  let preparingOutput = true;
   working = true;
+  $("error").hidden = true;
   lock(true);
   update();
   try {
@@ -447,11 +460,16 @@ $("convert").onclick = async () => {
       outputTransaction = transaction;
       outputDirectory = transaction.directory;
     }
+    preparingOutput = false;
     $("status").hidden = false;
     $("cancel").hidden = false;
     $("error").hidden = true;
     currentWorker.postMessage({ type: "convert", target, toIntel: $("intel").checked, mode: $("save").value, locale });
   } catch (error) {
+    if (currentWorker === worker && preparingOutput && error.name !== "AbortError") {
+      await fail(error, { keepInspection: true });
+      return;
+    }
     if (currentWorker !== worker) return;
     if (error.name === "AbortError") {
       $("cancel").hidden = true;
