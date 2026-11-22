@@ -23,9 +23,40 @@ STUB = "NotImplemented_nid_no_patch"
 NID_SUFFIX = bytes([0x51, 0x8D, 0x64, 0xA6, 0x35, 0xDE, 0xD8, 0xC1,
                     0xE6, 0xB0, 0x39, 0xB1, 0xC3, 0xE5, 0x52, 0x30])
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
+NID_POSTFIX = "_nid_postfix"
+NID_NO_PATCH = "_nid_no_patch"
+NID_NO_PATCH_CUT = "_nid_no_patch_cut"
+NID_DISAMBIG = "_nid_disambig"
+SDL_PREFIX = "SDL_"
+
+
+def strip_nid_postfix(name):
+    result = name
+    if result.endswith(NID_POSTFIX):
+        result = result[:-len(NID_POSTFIX)]
+    disambig_pos = result.rfind(NID_DISAMBIG)
+    if disambig_pos != -1:
+        suffix_start = disambig_pos + len(NID_DISAMBIG)
+        if suffix_start < len(result) and result[suffix_start:].isdigit():
+            result = result[:disambig_pos]
+    return result
+
+
+def is_nid_no_patch(name):
+    return name.endswith(NID_NO_PATCH) or name.startswith(SDL_PREFIX)
+
+
+def is_nid_no_patch_cut(name):
+    return name.endswith(NID_NO_PATCH_CUT)
 
 
 def compute_nid(name):
+    if is_nid_no_patch_cut(name):
+        name = name[:-len(NID_NO_PATCH_CUT)]
+    elif is_nid_no_patch(name):
+        pass  # use name as-is
+    else:
+        name = strip_nid_postfix(name)
     digest = hashlib.sha1(name.encode() + NID_SUFFIX).digest()
     reversed_head = digest[7::-1]
     nid = ""
@@ -94,7 +125,7 @@ def main():
     counts = {"implemented": 0, "stub": 0, "unknown": 0}
     missing = {}
     for entry in imports:
-        nid = entry["nid"]
+        nid = entry["nid"].split("#")[0]  # strip relocation suffix (#j#j etc.)
         library = entry.get("library", "")
         found = catalogue.get(library.removesuffix(".prx"), {}).get(nid) or by_nid.get(nid)
         if found is None:
