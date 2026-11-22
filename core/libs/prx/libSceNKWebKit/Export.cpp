@@ -1772,10 +1772,6 @@ int APS5_VABI _ZN7WebCore9FrameView30graphicsLayerForPlatformWidgetEPv() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI _ZN7WebCore16SQLiteFileSystem20databaseCreationTimeERKN3WTF6StringE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI _ZN7WebCore21JSCSSStyleDeclarationC2EPN3JSC9StructureERNS_17JSDOMGlobalObjectEON3WTF3RefINS_19CSSStyleDeclarationENS6_13DumbPtrTraitsIS8_EEEE() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9509,10 +9505,6 @@ int APS5_VABI WKPageCopyPendingAPIRequestURL() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI WKPageCopyRelatedPages() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI WKPageCopySessionState() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9580,13 +9572,6 @@ int APS5_VABI WKPageGetMediaState() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-
-
-int APS5_VABI WKPageGetProcessIdentifier() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-
 int APS5_VABI WKPageGetScaleFactor() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9644,10 +9629,6 @@ int APS5_VABI WKPageIsContentEditable() {
 }
 
 int APS5_VABI WKPageIsPlayingAudio() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageListenForLayoutMilestones() {
     NotImplemented_nid_no_patch(__func__);
 }
 
@@ -9823,10 +9804,6 @@ int APS5_VABI WKPageSetMediaVolume() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI WKPageSetMockCameraOrientation() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI WKPageSetMuted() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -9891,19 +9868,11 @@ int APS5_VABI WKPageSuspendActiveDOMObjectsAndAnimations() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI WKPageTerminate() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI WKPageTryClose() {
     NotImplemented_nid_no_patch(__func__);
 }
 
 int APS5_VABI WKPageTryRestoreScrollPosition() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI WKPageUpdateWebsitePolicies() {
     NotImplemented_nid_no_patch(__func__);
 }
 
@@ -16955,10 +16924,6 @@ int APS5_VABI _ZN7WebCore16NetworkSendQueueD1Ev() {
 }
 
 int APS5_VABI _ZN7WebCore16NetworkSendQueueD2Ev() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore16SQLiteFileSystem18deleteDatabaseFileERKN3WTF6StringE() {
     NotImplemented_nid_no_patch(__func__);
 }
 
