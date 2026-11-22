@@ -1,6 +1,7 @@
 #pragma once
 #include "prx/libSceNKWebKit/include/DoViCodecParameters.hpp"
 #include "prx/libSceNKWebKit/include/SecurityPolicyExports.hpp"
+#include "prx/libSceNKWebKit/include/VaryingRequestHeadersExports.hpp"
 #include "prx/libSceNKWebKit/include/WebCoreRegistrationSlotsExports.hpp"
 #include "prx/libSceNKWebKit/include/CredentialBaseExports.hpp"
 #include "prx/libSceNKWebKit/include/CrossOriginAccessControlExports.hpp"
@@ -38,6 +39,7 @@
 #include "prx/libSceNKWebKit/include/JscExports.hpp"
 #include "prx/libSceNKWebKit/include/NoOpExports.hpp"
 #include "prx/libSceNKWebKit/include/ProtoCallFrameExports.hpp"
+#include "prx/libSceNKWebKit/include/JscBytecodeCacheErrorExports.hpp"
 #include "prx/libSceNKWebKit/include/ParsedContentRangeExports.hpp"
 #include "prx/libSceNKWebKit/include/QualifiedNameExports.hpp"
 #include "prx/libSceNKWebKit/include/ResourceRequestExports.hpp"
