@@ -490,6 +490,37 @@ for (const outcome of ["error", "handle", "writable", "directory"]) {
   });
 }
 
+test("cancelling a conversion returns keyboard focus to the ZIP chooser", async t => {
+  const { get, workers } = await setup(t, "cancel-focus");
+  await selected(get, workers, "first.zip");
+  await get("convert").onclick();
+  assert.equal(get("cancel").hidden, false);
+  document.activeElement = get("cancel");
+  get("choose").focus = () => {
+    assert.equal(get("drop").hidden, false);
+    assert.equal(get("choose").disabled, false);
+    document.activeElement = get("choose");
+  };
+  await get("cancel").onclick();
+  assert.equal(document.activeElement, get("choose"));
+});
+
+test("cancel cleanup preserves focus moved to the language switch", async t => {
+  const cleanup = deferred();
+  const { get, workers } = await setup(t, "cancel-cleanup-focus", {
+    showSaveFilePicker: async () => ({ async createWritable() { return { abort: () => cleanup.promise }; } })
+  });
+  await selected(get, workers, "first.zip");
+  await get("convert").onclick();
+  document.activeElement = get("cancel");
+  get("choose").focus = () => { assert.fail("focus should stay on the language switch"); };
+  const cancelling = get("cancel").onclick();
+  document.activeElement = get("locale");
+  cleanup.resolve();
+  await cancelling;
+  assert.equal(document.activeElement, get("locale"));
+});
+
 for (const type of ["write", "close-file", "complete"]) {
   for (const reject of [false, true]) {
     test(`late ${type} ${reject ? "failure" : "success"} cannot acknowledge or complete a new job`, async t => {
@@ -617,6 +648,70 @@ for (const stage of ["picker", "writable"]) {
     await replacement.onmessage({ data: { type: "complete", mode: "zip", outputName: "replacement.elf", size: 3, apps: 1, release: "v1-test" } });
     assert.equal(get("done").hidden, false);
     assert.equal(get("error").hidden, true);
+  });
+}
+
+for (const kind of ["batch", "single", "folder"]) {
+  test("finished " + kind + " output follows a language change", async t => {
+    let folderName;
+    let removals = 0;
+    const directory = {
+      async getDirectoryHandle(name, options) {
+        if (!options?.create) throw Object.assign(new Error("missing"), { name: "NotFoundError" });
+        folderName = name;
+        return {};
+      },
+      async removeEntry() { removals++; }
+    };
+    const { get, workers } = await setup(t, "result-locale-" + kind, { showDirectoryPicker: async () => directory });
+    const inputs = kind === "batch" ? [{ name: "first.zip" }, { name: "second.zip" }] : [{ name: "first.zip" }];
+    get("file").files = inputs;
+    get("file").onchange();
+    const worker = workers[0];
+    await inspect(worker, inputs.length);
+    get("acknowledge").checked = true;
+    get("acknowledge").listeners.get("change")();
+    if (kind === "folder") {
+      get("save").value = "disk";
+      get("save").listeners.get("change")();
+    }
+    await get("convert").onclick();
+    assert.equal(worker.messages.at(-1).type, "convert");
+    await worker.onmessage({ data: {
+      type: "complete", mode: worker.messages.at(-1).mode, blob: kind === "folder" ? null : new Blob([new Uint8Array(5)]),
+      outputName: kind === "batch" ? "anyps5-apps" : "main.elf", size: 5, release: "v1-test", apps: inputs.length
+    } });
+    assert.equal(get("done").hidden, false);
+    const href = get("download").href;
+    const download = get("download").download;
+    const note = get("result-note");
+    const tag = readFileSync(new URL("../index.html", import.meta.url), "utf8").match(/<p id="result-note"[^>]*>/u)[0];
+    const i18nKey = tag.match(/\bdata-i18n="([^"]+)"/u)?.[1];
+    if (i18nKey) {
+      note.dataset = { i18n: i18nKey };
+      document.querySelectorAll = selector => selector === "[data-i18n]" ? [note] : [];
+    }
+    if (kind === "folder") {
+      assert.equal(folderName, "first-linux");
+      document.querySelector = () => ({ value: "windows" });
+    }
+    get("locale").onclick();
+    assert.equal(document.documentElement.lang, "de");
+    assert.match(get("result-info").textContent, /Systembibliotheken/);
+    if (kind === "folder") {
+      assert.match(get("result-info").textContent, /Gespeichert in first-linux\//);
+      assert.match(get("result-info").textContent, /chmod \+x "main\.elf"/);
+      assert.equal(note.hidden, true);
+      assert.equal(get("download").hidden, true);
+    } else {
+      assert.equal(get("download").href, href);
+      assert.equal(get("download").download, download);
+      assert.equal(get("download").hidden, false);
+      assert.match(note.textContent, kind === "batch" ? /chmod \+x \*\/\*\.elf/ : /Entpacke das gesamte ZIP/);
+    }
+    get("change").onclick();
+    assert.equal(get("done").hidden, true);
+    assert.equal(removals, 0);
   });
 }
 
