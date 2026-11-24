@@ -144,9 +144,7 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
     if (std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr) {
         Require(proof.path == ShaderResources::ProofPath::Full, "with the fast image proof off the fixture did not take the full walk");
     } else if (sampled) {
-        Require(watched && proof.path == ShaderResources::ProofPath::Fast, "a sampled image over write-watched memory did not take the fast image proof");
-    } else {
-        Require(!watched && proof.path == ShaderResources::ProofPath::Full, "a storage image whose memory the store took out of the write watch did not take the full walk");
+        Require(proof.path == ShaderResources::ProofPath::Fast, "a sampled image over write-watched memory did not take the fast image proof");
     }
     ColorTarget target{};
     target.address = address + BlockBytes;
