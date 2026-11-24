@@ -141,10 +141,6 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
     const char* pathName = proof.path == ShaderResources::ProofPath::Fast ? "fast"
             : proof.path == ShaderResources::ProofPath::Full ? "full" : "own-refreshed";
     std::printf("image reuse proof: %s over %s memory\n", pathName, watched ? "write-watched" : "compared");
-    // A sampled image over write-watched memory is the fixture that proves the fast path, so it is
-    // asserted. The path a storage image takes depends on whether the target can prove its overwritten
-    // range, and on whether the store left the memory write-watched, so it is only recorded here: the
-    // registration with APS5_NO_FAST_REVALIDATE asserts the full walk for both kinds on every host.
     if (std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr) {
         Require(proof.path == ShaderResources::ProofPath::Full, "with the fast image proof off the fixture did not take the full walk");
     } else if (sampled) {
