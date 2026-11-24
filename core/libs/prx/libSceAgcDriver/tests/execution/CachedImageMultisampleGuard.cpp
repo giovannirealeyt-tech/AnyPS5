@@ -137,9 +137,16 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
     };
     ShaderResources::ProofReport proof;
     Require(revalidate(&proof), "the unchanged image resources failed their initial proof");
-    if (std::getenv("APS5_NO_FAST_REVALIDATE") == nullptr) {
-        if (AgcDriver::GuestMemory::Watched(address, Side * Side * 4u)) Require(proof.path == ShaderResources::ProofPath::Fast, "the fixture did not exercise the fast image proof");
-        else std::puts("image memory is compared, not watched: fast image proof not tested; checking the image guards through the full proof");
+    const bool watched = AgcDriver::GuestMemory::Watched(address, Side * Side * 4u);
+    const char* pathName = proof.path == ShaderResources::ProofPath::Fast ? "fast"
+            : proof.path == ShaderResources::ProofPath::Full ? "full" : "own-refreshed";
+    std::printf("image reuse proof: %s over %s memory\n", pathName, watched ? "write-watched" : "compared");
+    if (std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr) {
+        Require(proof.path == ShaderResources::ProofPath::Full, "with the fast image proof off the fixture did not take the full walk");
+    } else if (sampled) {
+        Require(watched && proof.path == ShaderResources::ProofPath::Fast, "a sampled image over write-watched memory did not take the fast image proof");
+    } else {
+        Require(!watched && proof.path == ShaderResources::ProofPath::Full, "a storage image whose memory the store took out of the write watch did not take the full walk");
     }
     ColorTarget target{};
     target.address = address + BlockBytes;
