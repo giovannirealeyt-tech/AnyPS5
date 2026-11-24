@@ -26,8 +26,9 @@ Set a switch before starting the emulator. Unless noted, any value enables it. M
 | `APS5_TRACE_WAITS` | Blocking waits aggregated by guest call site, including timeout counts and longest waits, every three seconds. With `APS5_TRACE_WAITS_TID` the key is per OS thread. While `APS5_TRACE_SUBMIT_FLIP` is also on, the report is narrowed (header `[waits focus tid N]`) to the thread that submits flips: that probe publishes the busiest submitter and clears the table when it changes, so one thread's waits are not mixed with the rest of the process. |
 
 To inspect a guest address in a saved `APS5_TRACE_MEMORY` log, run
-`python3 tools/memory_trace_address.py <log> --address 0x... [--length <bytes>]`. It lists recorded mapping,
-remapping, protection, reservation and unmapping events whose ranges overlap the query, in log order. These are trace
+`python3 tools/memory_trace_address.py <log> --address 0x... [--length <bytes>] [--limit <events>]`. It lists recorded mapping,
+remapping, protection, reservation and unmapping events whose ranges overlap the query, in log order. By default it shows
+the last 40 matches. Raise `--limit` to inspect earlier events, such as the mapping that preceded a later unmap. These are trace
 records, not confirmation that each attempted operation succeeded; no matching event does not prove the address was
 unmapped.
 
@@ -79,6 +80,10 @@ See [Build](BUILD.md#performance-trace) for the trace format, summary fields and
 | `APS5_AB=<seconds>:<switch>[+<switch>...]` | Alternates phase A (the environment's settings) and phase B (the listed switches toggled) at flip packets within one run, each phase at least `<seconds>` long. Every phase change prints `[ab] phase A\|B <k> begins at present <n> (t <s> s)` and, `APS5_AB_SETTLE` seconds (default 2) later, `[ab] phase A\|B <k> settled at present <n> (t <s> s)`; `t` counts from the first flip. `APS5_AB_START=<n>` starts at flip `<n>`, `APS5_AB_START=<n>s` `<n>` seconds after the first flip. Only runtime switches (`RuntimeSwitch` in `core/libs/prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp`; their rows in `docs/dev/ENVIRONMENT.md` say that `APS5_AB` can toggle them) can be listed; any other name fails the first flip. `python tools/ab_split.py <log>` prints the mean of each periodic report (`[present]`, `[gputime]`, `[draw] pipelined`, `[syncwait]`) per phase, counting only reports that lie wholly inside a settled phase, and each B phase against its neighbouring A phases. |
 | `APS5_VIDEOOUT_TELEMETRY_DIR=<path>` | Writes the presents and the pad changes of a run to `<path>/videoout.jsonl`; see [Usage](../user/USAGE.md#video-out-and-pad-telemetry). |
 | `APS5_VIDEOOUT_TELEMETRY_EVERY=<presents>` | Number of presents between two `present` lines in that file; default 30. `1` writes every frame, for per-frame frame-time work. A value that is not a positive decimal integer, including `0` and an empty one, is ignored with one `[videoout-telemetry] invalid APS5_VIDEOOUT_TELEMETRY_EVERY` line on stderr; values above 1,000,000 are clamped. It changes only the sampling rate: line format, the `contract` level and the 200 ms writer batch are unchanged. |
+
+For an event trace, repeat `--thread <name>` with exact track names to focus the digest on selected threads.
+Quote a name that contains spaces. This option applies to `aps5-trace-*.json.gz` and uncompressed event traces.
+Use the interval digest without a thread filter for `aps5-summary.jsonl`.
 
 ## Shader registers
 
