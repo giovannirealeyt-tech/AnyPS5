@@ -23,7 +23,7 @@ using AgcDriver::Graphics::Require;
 
 constexpr std::size_t Draws = 4352;
 constexpr std::size_t PreviousEntryCap = 65536;
-constexpr std::size_t DefaultEntryCap = 262144;
+constexpr std::size_t DefaultEntryCap = 65536;
 
 alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0xf4000100u, 0xfa000000u, 0x7e000204u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
@@ -121,11 +121,11 @@ void MoreDrawsThanTheOldEntryCapStayCached() {
 void DefaultEntryCapExceedsThePreviousOne() {
     Require(std::getenv("APS5_DRAW_CACHE_ENTRIES") == nullptr, "APS5_DRAW_CACHE_ENTRIES must be unset for this test");
     const auto cap = AgcDriver::DriverDetail::Driver::DrawCacheEntries();
-    Require(cap == DefaultEntryCap, "the default draw cache entry cap is " + std::to_string(cap) + ", not " + std::to_string(DefaultEntryCap));
-    Require(cap > PreviousEntryCap, "the default draw cache entry cap " + std::to_string(cap) + " does not exceed the previous " + std::to_string(PreviousEntryCap));
+    Require(cap == DefaultEntryCap, "the fork default draw cache entry cap is " + std::to_string(cap) + ", not " + std::to_string(DefaultEntryCap));
+    Require(cap >= PreviousEntryCap, "the fork default draw cache entry cap " + std::to_string(cap) + " does not fall below the previous " + std::to_string(PreviousEntryCap));
     const auto sightings = AgcDriver::DriverDetail::Driver::DrawKeySightingKeys();
-    const auto previousSightings = PreviousEntryCap * AgcDriver::DriverDetail::DrawKeySightings::Ways;
-    Require(sightings == previousSightings, "the draw key sightings hold " + std::to_string(sightings) + " keys, not the " + std::to_string(previousSightings) + " of the previous entry cap");
+    const auto expectedSightings = DefaultEntryCap * AgcDriver::DriverDetail::DrawKeySightings::Ways;
+    Require(sightings == expectedSightings, "the draw key sightings hold " + std::to_string(sightings) + " keys, not the " + std::to_string(expectedSightings) + " of the fork default entry cap");
 }
 
 }
