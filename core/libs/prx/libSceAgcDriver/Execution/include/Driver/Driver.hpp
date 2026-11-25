@@ -135,6 +135,7 @@ public:
     DispatchCacheFootprint DrawCacheSize();
     static std::uint64_t DispatchCacheBytes();
     static std::size_t DrawCacheEntries();
+    static std::size_t drawCacheEntries();
     static std::size_t DrawKeySightingKeys();
     static std::uint64_t DrawCacheBytes();
     static ShaderMemory::PendingWrite QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
