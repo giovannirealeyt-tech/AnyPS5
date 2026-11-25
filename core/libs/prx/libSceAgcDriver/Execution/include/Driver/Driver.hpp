@@ -134,6 +134,8 @@ public:
     DispatchCacheFootprint DispatchCacheSize();
     DispatchCacheFootprint DrawCacheSize();
     static std::uint64_t DispatchCacheBytes();
+    static std::size_t DrawCacheEntries();
+    static std::size_t DrawKeySightingKeys();
     static std::uint64_t DrawCacheBytes();
     static ShaderMemory::PendingWrite QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
@@ -220,7 +222,6 @@ private:
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();
-    static std::size_t drawCacheEntries();
     static bool drawCacheIndirect();
     static bool drawCachePushWord();
     static bool verifyDrawPushWord();
