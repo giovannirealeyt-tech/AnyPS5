@@ -12402,7 +12402,8 @@ void verifyQuadMaskNeighbourReads() {
     };
     {
         constexpr std::array<std::uint32_t, 3> sampleBarycentrics{0xf800180fu, 0x01000100u, 0xbf810000u};
-        constexpr std::array<std::uint32_t, 2> offsetCapabilities{spv::CapabilityShader, spv::CapabilityInterpolationFunction};
+        constexpr std::array<std::uint32_t, 3> offsetCapabilities{spv::CapabilityShader, spv::CapabilityInterpolationFunction, spv::CapabilityFragmentBarycentricKHR};
+        constexpr std::array<std::string_view, 1> offsetExtensions{"SPV_KHR_fragment_shader_barycentric"};
         RecompileRequest request{};
         request.shader = {ShaderStage::Fragment, 0x58000u, sampleBarycentrics, 0, {}};
         request.context.waveSize = 32u;
@@ -12416,6 +12417,7 @@ void verifyQuadMaskNeighbourReads() {
         request.target.subgroupSize = 32u;
         request.target.fragmentShaderBarycentricEnabled = true;
         request.target.supportedCapabilities = offsetCapabilities;
+        request.target.supportedExtensions = offsetExtensions;
         request.layout.pushConstantSizeBytes = 128u;
         request.useCache = false;
         const auto offset = Recompile(request);
