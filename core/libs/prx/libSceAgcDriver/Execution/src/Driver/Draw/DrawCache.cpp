@@ -66,6 +66,14 @@ std::size_t Driver::drawCacheEntries() {
     return entries;
 }
 
+std::size_t Driver::DrawCacheEntries() {
+    return drawCacheEntries();
+}
+
+std::size_t Driver::DrawKeySightingKeys() {
+    return std::min<std::size_t>(DrawCacheEntries(), 65536) * DrawKeySightings::Ways;
+}
+
 std::uint64_t Driver::DrawCacheBytes() {
     static const std::uint64_t bytes = [] {
         const char* text = std::getenv("APS5_DRAW_CACHE_BYTES");
