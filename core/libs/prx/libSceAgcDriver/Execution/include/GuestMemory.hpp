@@ -6,7 +6,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -56,6 +55,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 // guest writes made meanwhile to untouched bytes survive. Compares in 256-byte blocks.
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint32_t byteStoreLimit);
+void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stored);
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince);
 std::uint32_t ChangedByteStoreLimit();
 void WriteChangedKeepingGuest(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
@@ -135,6 +135,11 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void(std::span<std::byte>)>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 void SetOwnStoreCompare(bool compare);
+void SetLeftWatchCompare(bool compare);
+void SeedComparedPages(std::uint64_t address, std::span<const std::byte> bytes);
+void UpdateComparedPages(std::uint64_t address, std::span<const std::byte> bytes);
+void ChangedComparedPages(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed);
+void SetComparedDecisionHookForTest(void (*hook)());
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool DriverStoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
@@ -359,56 +364,6 @@ private:
 // is written as 0), newest first, skipping `skip` frames above the caller; returns how many were
 // written. Stack unwinding, so only for rare, profiled events.
 std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned skip);
-
-struct TextureCollectStats {
-    std::uint64_t calls = 0;
-    std::uint64_t memoHits = 0;
-    std::uint64_t memoHitEpochMap = 0;
-    std::uint64_t memoHitThread = 0;
-    std::uint64_t memoHitShared = 0;
-    std::uint64_t walkAttempted = 0;
-    std::uint64_t walkFailed = 0;
-    std::uint64_t earlyExitPreWalk = 0;
-    // FT17-C direct timing buckets: one terminal category per scoped call, so the three are
-    // a partition of the scoped calls' instrumented time (see collectWrites).
-    std::uint64_t nsMemoHit = 0;
-    std::uint64_t nsWalk = 0;
-    std::uint64_t nsEarlyExit = 0;
-    // Retrograde clock (t1 < t0) seen on an instrumented call: the delta is dropped for that
-    // call and the event is counted instead, never wrapped into a u64 difference.
-    std::uint64_t collectClockViolations = 0;
-};
-
-// Runtime gate for the FT17-C timing buckets (default OFF), in the same env-probe style as
-// the other diagnostic switches: read once, cached off the hot path. With the gate off
-// collectWrites takes no clock reading and accumulates no timing bucket; the preexisting
-// CollectWrites call site, the `textureCollectDepth` branch and the Collect section
-// bookkeeping stay as they are (declared, not invented away as zero overhead).
-inline bool TextureCollectTimingEnabled() {
-    static const bool enabled = std::getenv("APS5_TEXTURE_COLLECT_TIMING") != nullptr;
-    return enabled;
-}
-
-// Test-only hooks for deterministic CPU tests, not a runtime API: an injectable monotonic ns
-// clock, a gate override and a mapping-recheck override. They are compiled only when the
-// translation unit defines APS5_TEXTURE_COLLECT_TEST_HOOKS (test targets only), so production
-// leaves them out entirely and uses steady_clock plus the cached env gate above: no hook state,
-// no hook symbols and no override branch reach the shipped PRX.
-#ifdef APS5_TEXTURE_COLLECT_TEST_HOOKS
-namespace detail {
-using TextureCollectClockFn = std::uint64_t(*)();
-void SetTextureCollectTestClock(TextureCollectClockFn now) noexcept;
-void SetTextureCollectTimingOverride(const bool* enabled) noexcept;
-// FT17-L: replaces the mapping generation read at the R3/R4 memo-probe recheck only; the
-// default (unset) rechecks against the real generation, so production behaviour is unchanged.
-using CollectRecheckMappingFn = std::uint64_t(*)();
-void SetCollectRecheckMappingOverride(CollectRecheckMappingFn override) noexcept;
-}
-#endif
-
-void EnterTextureCollectScope();
-void LeaveTextureCollectScope();
-TextureCollectStats TakeTextureCollectStats();
 
 }
 
