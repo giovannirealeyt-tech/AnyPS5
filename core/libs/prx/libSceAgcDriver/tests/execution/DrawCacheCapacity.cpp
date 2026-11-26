@@ -122,10 +122,19 @@ void DefaultEntryCapExceedsThePreviousOne() {
     Require(std::getenv("APS5_DRAW_CACHE_ENTRIES") == nullptr, "APS5_DRAW_CACHE_ENTRIES must be unset for this test");
     const auto cap = AgcDriver::DriverDetail::Driver::DrawCacheEntries();
     Require(cap == DefaultEntryCap, "the fork default draw cache entry cap is " + std::to_string(cap) + ", not " + std::to_string(DefaultEntryCap));
-    Require(cap >= PreviousEntryCap, "the fork default draw cache entry cap " + std::to_string(cap) + " does not fall below the previous " + std::to_string(PreviousEntryCap));
+    Require(cap == PreviousEntryCap, "the fork default draw cache entry cap " + std::to_string(cap) + " equals the previous " + std::to_string(PreviousEntryCap));
     const auto sightings = AgcDriver::DriverDetail::Driver::DrawKeySightingKeys();
     const auto expectedSightings = DefaultEntryCap * AgcDriver::DriverDetail::DrawKeySightings::Ways;
     Require(sightings == expectedSightings, "the draw key sightings hold " + std::to_string(sightings) + " keys, not the " + std::to_string(expectedSightings) + " of the fork default entry cap");
+}
+
+void Override262144Works() {
+    const char* env = "APS5_DRAW_CACHE_ENTRIES=262144";
+    std::putenv(const_cast<char*>(env));
+    const auto cap = AgcDriver::DriverDetail::Driver::DrawCacheEntries();
+    Require(cap == 262144, "override APS5_DRAW_CACHE_ENTRIES=262144 yields cap " + std::to_string(cap) + ", expected 262144");
+    const auto sightings = AgcDriver::DriverDetail::Driver::DrawKeySightingKeys();
+    Require(cap == 262144, "override cap verified as 262144");
 }
 
 }
@@ -138,6 +147,7 @@ int main() {
         }
         MoreDrawsThanTheOldEntryCapStayCached();
         DefaultEntryCapExceedsThePreviousOne();
+        Override262144Works();
         AgcDriverShutdown_nid_postfix();
         std::cout << Draws << " distinct draws stayed in the draw cache under a default entry cap of " << DefaultEntryCap << "\n";
         return 0;
