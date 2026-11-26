@@ -551,7 +551,13 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 #endif
 }
 
+bool MemoryProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
 void CountReadCaller(const void* returnAddress) {
+    if (!MemoryProfiled()) return;
     thread_local std::uint32_t sampled = 0;
     // Sampled at the same rate as the callers, in step with them (CountCaller advances the counter).
     if ((sampled + 1) % 256 == 0) readSiteSamples[static_cast<std::size_t>(CurrentReadSite())].fetch_add(256, std::memory_order_relaxed);
@@ -559,13 +565,9 @@ void CountReadCaller(const void* returnAddress) {
 }
 
 void CountWriteCaller(const void* returnAddress) {
+    if (!MemoryProfiled()) return;
     thread_local std::uint32_t sampled = 0;
     CountCaller(Profile().writeCallers, sampled, 16, returnAddress);
-}
-
-bool MemoryProfiled() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return profile;
 }
 
 bool CollectCallersProfiled() {
@@ -591,7 +593,6 @@ void RecordCollectCaller(unsigned long long offset, std::uint64_t bytes, std::ui
     slot->maxBytes = std::max(slot->maxBytes, bytes);
     if (slot != &profile.collectCallerOverflow) slot->offset = offset;
 }
-
 class TimedAccess {
 public:
     TimedAccess(MemoryCounterKind kind, std::uint64_t bytes) : kind(kind), bytes(bytes), start(MemoryProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
@@ -1726,11 +1727,17 @@ struct WriteTracker {
         std::array<std::uint64_t, WritePagesPerBlock> pages{};
     };
     std::unordered_map<std::uint64_t, CpuPages> cpuPages;
+    std::unordered_map<std::uint64_t, CpuPages> cpuStoredPages;
     std::unordered_map<std::uint64_t, CpuPages> walkPages;
     std::unordered_map<std::uint64_t, CpuPages> windowPages;
     std::map<std::uint64_t, std::uint64_t> refused;
 
     void noteCpuStore(std::uint64_t begin, std::uint64_t end, std::uint64_t stampGeneration) {
+        notePages(cpuPages, begin, end, stampGeneration);
+        notePages(cpuStoredPages, begin, end, stampGeneration);
+    }
+
+    void noteCpuTouch(std::uint64_t begin, std::uint64_t end, std::uint64_t stampGeneration) {
         notePages(cpuPages, begin, end, stampGeneration);
     }
 
@@ -1906,7 +1913,7 @@ struct WriteTracker {
         return leaf != nullptr ? leaf->cpuBlocks[block % LeafBlocks] : 0;
     }
 
-    bool storedOver(std::uint64_t address, std::uint64_t end, std::uint64_t generation, bool walked) const {
+    bool storedOver(std::uint64_t address, std::uint64_t end, std::uint64_t generation, bool walked, bool storesOnly = false) const {
         for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
             if (stampOf(block) <= generation) continue;
             const auto begin = blockBegin(block);
@@ -1921,7 +1928,7 @@ struct WriteTracker {
                 return false;
             };
             if (cpuPages.find(block) == cpuPages.end() && cpuStampOf(block) > generation) return true;
-            if (newerPage(cpuPages, from, to)) return true;
+            if (newerPage(storesOnly ? cpuStoredPages : cpuPages, from, to)) return true;
             if (walked && newerPage(walkPages, from, to)) return true;
             const auto found = driverPieces.find(block);
             if (found == driverPieces.end()) {
@@ -1967,9 +1974,29 @@ struct WriteTracker {
         return false;
     }
 
-    bool rangeUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool walked = true) const {
+    bool rangeUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t since, bool walked = true, bool storesOnly = false) const {
         if (refusedSince(address, address + bytes, since)) return false;
-        return unchanged(blockOf(address), blockOf(address + bytes - 1), since) || !storedOver(address, address + bytes, since, walked);
+        return unchanged(blockOf(address), blockOf(address + bytes - 1), since) || !storedOver(address, address + bytes, since, walked, storesOnly);
+    }
+
+    bool cpuStoreUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t generation) const {
+        const auto first = blockOf(address);
+        const auto last = blockOf(address + bytes - 1u);
+        const auto end = address + bytes;
+        for (auto block = first; block <= last; ++block) {
+            if (const auto found = cpuPages.find(block); found != cpuPages.end()) {
+                const auto stored = cpuStoredPages.find(block);
+                const auto begin = blockBegin(block);
+                const auto from = std::max(address, begin) - begin;
+                const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+                for (auto page = from / WritePageBytes; page <= (to - 1u) / WritePageBytes; ++page) {
+                    if (found->second.pages[page] > generation && stored != cpuStoredPages.end() && stored->second.pages[page] > generation) return false;
+                }
+            } else if (cpuStampOf(block) > generation) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool cpuUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t generation) const {
@@ -2201,9 +2228,10 @@ struct StampRuns {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> windowRuns;
 };
 
-void noteWrittenRun(StampRuns& runs, std::uintptr_t begin, std::uintptr_t end, std::uint64_t generation) {
-    if (runs.kind != StampKind::Driver) runs.tracker.noteCpuStore(begin, end, generation);
-    else runs.tracker.noteWalkStore(begin, end, generation);
+void noteWrittenRun(StampRuns& runs, std::uintptr_t begin, std::uintptr_t end, std::uint64_t generation, bool changed = true) {
+    if (runs.kind == StampKind::Driver) runs.tracker.noteWalkStore(begin, end, generation);
+    else if (changed && runs.kind != StampKind::ImportWindow) runs.tracker.noteCpuStore(begin, end, generation);
+    else runs.tracker.noteCpuTouch(begin, end, generation);
 }
 
 void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
@@ -2233,9 +2261,9 @@ void stampWindowRuns(StampRuns& runs) {
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     std::size_t index = 0;
     for (const auto& [begin, end] : runs.windowRuns) {
-        noteWrittenRun(runs, static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end), generation);
         for (auto page = begin; page < end; page += WritePageBytes) {
             const bool kept = held[index++] != 0;
+            noteWrittenRun(runs, static_cast<std::uintptr_t>(page), static_cast<std::uintptr_t>(page + WritePageBytes), generation, !kept);
             if (!kept) tracker.notePages(tracker.windowPages, page, page + WritePageBytes, generation);
             tracker.stamp(tracker.blockOf(page), generation, kept ? runs.window->held : runs.kind);
         }
@@ -3393,7 +3421,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 #ifdef _WIN32
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return true;
 #endif
-    return tracker.storedOver(address, address + bytes, generation, false);
+    return tracker.storedOver(address, address + bytes, generation, false, true);
 }
 
 bool DriverStoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -3534,6 +3562,15 @@ bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::ui
     tracker.initialize();
     if (!tracker.watched || generation == 0u || !tracker.covers(address, bytes)) return false;
     return tracker.cpuUnchanged(address, bytes, generation) && tracker.rangeUnchanged(address, bytes, generation, false);
+}
+
+bool StoreUnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (bytes == 0u || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0u || !tracker.covers(address, bytes)) return false;
+    return tracker.cpuStoreUnchanged(address, bytes, generation) && tracker.rangeUnchanged(address, bytes, generation, false, true);
 }
 
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
