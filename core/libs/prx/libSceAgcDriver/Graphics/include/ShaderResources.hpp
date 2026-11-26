@@ -255,7 +255,6 @@ public:
         std::vector<Snapshot> snapshots;
         ~DrawBindings();
     };
-    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, const DrawBindings* bindings) const;
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
@@ -308,6 +307,7 @@ public:
     void CopyBacksAfterRun(std::shared_ptr<ShaderResources> self) { afterRunSelf = std::move(self); }
     void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    bool StorePages() const;
     bool SpaceReuse() const { return spaceReuse; }
     static bool SpaceReuseDisabled();
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
@@ -568,7 +568,7 @@ private:
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
-    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}, std::size_t* comparisons = nullptr) const;
+    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
     bool movedInPlace(Recorder& recorder, const Allocation& item, std::uint64_t address, std::uint64_t size, MovedBuffer& entry, bool counted = true) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
@@ -643,15 +643,6 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
-        // Snapshot textures the lookup left in the texture cache: their cache key (descriptor words,
-        // component mapping, depth compare; the device is the context's), so a proof over memory
-        // without write generations can repeat the lookup's hit check on the entry (fastRevalidate).
-        bool keyed = false;
-        std::array<std::uint32_t, 8> keyWords{};
-        std::array<std::uint32_t, 4> keyComponents{};
-        bool keyDepthCompare = false;
-        // Committed-write proof for a snapshot over memory without write generations: the generation
-        // the ranges below were taken at, the ranges, and whether the proof in progress passed.
         std::uint64_t committedGeneration = 0;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
         bool committedProved = false;
@@ -681,7 +672,7 @@ private:
     // holds; `reason` receives why the proof failed (Count: it passed), `overlapping` the surfaces
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
-    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only = nullptr, bool withStorage = true, bool retry = false);
+    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, const std::vector<std::size_t>* only = nullptr, bool withStorage = true);
     enum class IndexOutcome : std::uint8_t { Accepted, Partial, Fallback };
     IndexOutcome indexRevalidate(std::span<const CompiledShader> shaders, std::uint64_t serialBefore);
     void subscribeIndex(std::span<const CompiledShader> shaders);
