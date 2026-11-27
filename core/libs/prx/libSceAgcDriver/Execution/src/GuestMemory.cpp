@@ -2723,7 +2723,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     }
     if (collectPrefetchThread) {
         if (done != 0) prefetchWalks.fetch_add(1, std::memory_order_relaxed);
-    } else if (shared && done != 0 && status == Status::Complete && collectPrefetchEnabled() && std::getenv("APS5_ENABLE_COLLECT_PREFETCH") != nullptr) {
+    } else if (shared && done != 0 && status == Status::Complete && collectPrefetchWalking()) {
         notePrefetchRange(first, stop);
     }
     return finish(CollectTiming::Walk, Observation{Status::Complete, generation});
