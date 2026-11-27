@@ -7976,4 +7976,8 @@ bool ShaderResources::ReadsImage(const StorageTexture* image) const {
     return std::any_of(storageTextures.begin(), storageTextures.end(), [&](const auto& storage) { return storage.get() == image; });
 }
 
+bool ShaderResources::StorePages() const {
+    return bda != nullptr && bda->StorePages();
+}
+
 }
