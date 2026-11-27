@@ -43,6 +43,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -2387,8 +2388,6 @@ std::uint64_t recheckMappingGeneration() {
 struct CollectSinceSlot {};
 }
 
-struct CollectSinceSlot {};
-
 struct CollectPrefetch {
     static constexpr std::size_t Slots = 16;
     static constexpr std::size_t RangesPerEpoch = 8192;
@@ -2457,6 +2456,7 @@ void notePrefetchRange(std::uint64_t first, std::uint64_t stop) {
         }
     }
     last = bump;
+}
 
 Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     using Status = Observation::Status;
@@ -2882,6 +2882,8 @@ void BumpCollectEpochSince(std::uint64_t since) {
     HostThreadSlot<std::uint64_t, CollectSinceSlot>::Set(since == 0 ? now : std::max(previous, std::min(since, now)));
 }
 
+void bumpCollectPrefetch();
+
 void BumpCollectEpoch() {
     HostThreadSlot<std::uint64_t, CollectSinceSlot>::Set(SteadyNanoseconds());
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -2938,6 +2940,7 @@ void bumpCollectPrefetch() {
         }
     }
     prefetch.wake.notify_one();
+}
 
 void SetCollectPrefetch(bool enabled) {
     collectPrefetchSetting.store(enabled ? 1 : 0, std::memory_order_relaxed);
@@ -2945,6 +2948,7 @@ void SetCollectPrefetch(bool enabled) {
 
 std::uint64_t CollectPrefetchWalks() {
     return prefetchWalks.load(std::memory_order_relaxed);
+}
 
 std::uint64_t ThreadCollectEpoch() {
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;

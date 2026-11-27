@@ -1050,6 +1050,8 @@ void CheckPrefetchAnswersNextPeriod() {
 
 }
 
+}
+
 int main(int argc, char** argv) {
     try {
         // The epoch collect map enablement is read once per process (function-local static in
