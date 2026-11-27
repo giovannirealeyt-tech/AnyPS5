@@ -498,6 +498,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     ++drawEntryCounters.dataHits;
                     ++drawEntryCounters.shapeHits;
                     drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
+                    drawRelocationPending.donor = dataEntry;
                 } else {
                     ++drawEntryCounters.shapeMisses;
                 }
