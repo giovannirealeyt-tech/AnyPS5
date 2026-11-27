@@ -1015,7 +1015,7 @@ void CheckStoreAfterSubmit() {
 
 int main(int argc, char** argv) {
     try {
-// The epoch collect map enablement is read once per process (function-local static in
+        // The epoch collect map enablement is read once per process (function-local static in
         // GuestMemory.cpp): disabling it here, before the first collect, selects the R4
         // thread-memo probe path for this whole run.
         if (argc == 2 && std::string(argv[1]) == "--recheck-thread") {
