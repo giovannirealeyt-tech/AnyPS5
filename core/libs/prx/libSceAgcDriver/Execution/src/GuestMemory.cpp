@@ -2414,7 +2414,8 @@ CollectPrefetch& collectPrefetch() {
 std::atomic<int> collectPrefetchSetting{-1};
 
 bool collectPrefetchEnabled() {
-    return false; // DEBUG-ISOLATE
+    static const bool enabled = std::getenv("APS5_ENABLE_COLLECT_PREFETCH") != nullptr;
+    return enabled && collectMemoEnabled();
 }
 
 bool collectPrefetchWalking() {
