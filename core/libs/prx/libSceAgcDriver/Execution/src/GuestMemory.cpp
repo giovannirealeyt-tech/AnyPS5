@@ -2508,13 +2508,7 @@ void bumpCollectPrefetch() {
     prefetch.wake.notify_one();
 }
 
-void SetCollectPrefetch(bool enabled) {
-    collectPrefetchSetting.store(enabled ? 1 : 0, std::memory_order_relaxed);
-}
 
-std::uint64_t CollectPrefetchWalks() {
-    return prefetchWalks.load(std::memory_order_relaxed);
-}
 
 Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     using Status = Observation::Status;
@@ -2734,6 +2728,14 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     return finish(CollectTiming::Walk, Observation{Status::Complete, generation});
 }
 
+}
+
+void SetCollectPrefetch(bool enabled) {
+    collectPrefetchSetting.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t CollectPrefetchWalks() {
+    return prefetchWalks.load(std::memory_order_relaxed);
 }
 
 Observation Observe(std::uint64_t address, std::size_t bytes) {
