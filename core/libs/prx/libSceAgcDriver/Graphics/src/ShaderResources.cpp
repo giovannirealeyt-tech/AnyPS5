@@ -882,9 +882,10 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
 }
 
 std::span<const std::uint32_t> firstLayerWords(std::span<const std::uint32_t> words, std::optional<ShaderRecompiler::DescriptorImageShape> shape, std::array<std::uint32_t, 8>& narrowed, bool report) {
-    if (shape != ShaderRecompiler::DescriptorImageShape::Image2D || words.size() != narrowed.size() || IsNullSampledTextureResource(words)) return words;
+    if ((shape != ShaderRecompiler::DescriptorImageShape::Image2D && shape != ShaderRecompiler::DescriptorImageShape::Image1D) || words.size() != narrowed.size() || IsNullSampledTextureResource(words)) return words;
     try {
-        if (!FirstLayerDescriptor(words, narrowed)) return words;
+        const auto array = shape == ShaderRecompiler::DescriptorImageShape::Image1D ? TextureDimension::k1DArray : TextureDimension::k2DArray;
+        if (DecodeTextureResource(words).dimension != array || !FirstLayerDescriptor(words, narrowed)) return words;
     } catch (const std::runtime_error&) {
         return words;
     }
@@ -893,7 +894,8 @@ std::span<const std::uint32_t> firstLayerWords(std::span<const std::uint32_t> wo
         const auto count = narrowings.fetch_add(1) + 1;
         if (count <= 5 || (count & (count - 1)) == 0) {
             const auto resource = DecodeTextureResource(words);
-            std::fprintf(stderr, "[gpu] 2D read of the 2D array 0x%llx (%ux%u format %u, slices %u..%u) built from slice %u alone; %llu such reads\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, resource.baseArray, resource.depthOrLastArray, resource.baseArray, static_cast<unsigned long long>(count));
+            const char* dimension = resource.dimension == TextureDimension::k1DArray ? "1D" : "2D";
+            std::fprintf(stderr, "[gpu] %s read of the %s array 0x%llx (%ux%u format %u, slices %u..%u) built from slice %u alone; %llu such reads\n", dimension, dimension, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, resource.baseArray, resource.depthOrLastArray, resource.baseArray, static_cast<unsigned long long>(count));
         }
     }
     return narrowed;
@@ -3224,11 +3226,15 @@ void ShaderResources::noteReusable() {
     // Taken whether or not the object turns out reusable: the lookups' records are this build's.
     captureValidation(spaceReusable);
     reusable = false;
+    perUseTextures = false;
     importsReconcilable = false;
     spaceReuse = false;
     directRegions.clear();
     if (!spaceReusable && (htileClear.has_value() || guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled()))) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
+    static const bool noPerUseTemplates = std::getenv("APS5_NO_PER_USE_TEXTURE_TEMPLATES") != nullptr;
+    const bool perUse = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); });
+    if (perUse && (noPerUseTemplates || spaceReusable || !recordsEveryTexture())) return;
+    perUseTextures = perUse;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     if (spaceReusable) {
         spaceReuse = true;
@@ -3542,7 +3548,7 @@ namespace {
 // of the reused ones, fast = every image proved current from stamps, full = the lookups were repeated.
 // Why the fast path left an object to the full walk (the "fast-fail by reason" counts).
 using FastFail = ShaderResources::FastFail;
-constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface", "replaced texture", "audit"};
+constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> FastFailNames{"no record", "collect", "pending image", "evicted image", "memory changed", "keys", "cleared view", "storage keys", "depth surface", "replaced texture", "audit", "per-use texture"};
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
@@ -3566,6 +3572,7 @@ struct RevalidateProfile {
     // Epoch gate: registry scans skipped because the pending serial was unchanged, and import
     // serial loops skipped because the table's identity was unchanged.
     std::atomic<std::uint64_t> serialSkips{0};
+    std::atomic<std::uint64_t> perUsePartial{0};
     std::atomic<std::uint64_t> importSkips{0};
     // Elements with DCC keys the fast path accepted through the images' key proofs.
     std::atomic<std::uint64_t> keysProven{0};
@@ -3670,6 +3677,11 @@ void countOwnRefresh(bool storage) {
 bool OwnImageRefreshEnabled() {
     static const bool disabled = std::getenv("APS5_NO_OWN_IMAGE_REFRESH") != nullptr;
     return !disabled;
+}
+
+bool PerUsePartialWalk() {
+    static const bool enabled = std::getenv("APS5_NO_PER_USE_PARTIAL_WALK") == nullptr;
+    return enabled;
 }
 
 // APS5_VERIFY_PROOFS=1: after every own-object refresh the full walk runs beside the proof and the
@@ -3818,6 +3830,10 @@ void LastRecordIndices(std::span<const void* const> logged, std::span<const void
 bool ShaderResources::keepsTemplateRecords() const {
     static const bool always = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
     return always || !(usesBda || (usesFaultBuffer && LoopGuardEnabled()));
+}
+
+bool ShaderResources::recordsEveryTexture() const {
+    return validatedTextures.size() == textures.size() && std::all_of(validatedTextures.begin(), validatedTextures.end(), [](const ValidatedSurface& surface) { return surface.valid; });
 }
 
 // Turns the lookups' records into this object's per-texture validation records (see
@@ -4800,7 +4816,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         SpaceSetOutcome(false, SpacePath::NotInvoked, SpaceOutcome::RejectImageViews);
         return false;
     }
-    if (EpochProofs()) {
+    if (EpochProofs() && !perUseTextures) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
@@ -4900,15 +4916,28 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
-    const auto fullWalk = [&] {
-        lastFullWalk = std::chrono::steady_clock::now();
-        walkImportGeneration = HostImportSetGeneration();
+    struct WalkMismatch {
+        const char* what = nullptr;
+        std::size_t index = 0;
+        bool storage = false;
+    } mismatch;
+    const auto fullWalk = [&](bool partial) {
+        if (!partial) {
+            lastFullWalk = std::chrono::steady_clock::now();
+            walkImportGeneration = HostImportSetGeneration();
+        }
         lookupLog().clear();
+        mismatch = {};
+        const auto miss = [&](const char* what, std::size_t index, bool storage = false) {
+            mismatch = {what, index, storage};
+            return false;
+        };
+        const auto skipped = [&](std::size_t index) { return partial && index < textures.size() && !textures[index]->RefreshedPerUse(); };
         BuildLookups lookups;
         std::size_t textureIndex = 0;
         std::size_t storageIndex = 0;
         for (const auto& shader : shaders) {
-            if (shader.program == nullptr) return false;
+            if (shader.program == nullptr) return miss("a stage without a program at texture", textureIndex);
             for (const auto& binding : shader.program->bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
                 if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
@@ -4918,18 +4947,26 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                         std::array<std::uint32_t, 8> narrowed{};
                         const auto words = firstLayerWords(raw, binding.imageShape, narrowed, false);
                         if (IsNullSampledTextureResource(words)) continue;
+                        if (skipped(textureIndex)) {
+                            ++textureIndex;
+                            continue;
+                        }
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components = ViewComponents(resource);
                         const VkImageViewType multisampleViewType = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
                         const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
-                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, depthCompare, multisampleViewType, layerRowsBinding(binding.imageShape, resource, depthCompare)) != textures[textureIndex]) return false;
+                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, depthCompare, multisampleViewType, layerRowsBinding(binding.imageShape, resource, depthCompare)) != textures[textureIndex]) return miss("sampled texture", textureIndex);
                         ++textureIndex;
                     }
                 } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                         if (IsNullTextureResource(words)) continue;
-                        if (storageIndex >= storageTextures.size()) return false;
+                        if (storageIndex >= storageTextures.size()) return miss("storage image past the build's", storageIndex, true);
+                        if (partial) {
+                            ++storageIndex;
+                            continue;
+                        }
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else {
@@ -4938,7 +4975,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                             const StorageTexture::OverwriteScope overwrite(claim ? &*claim : nullptr);
                             expected = cachedStorageTexture(context, words, decoded, storageMips[storageIndex], 0, storageWritten[storageIndex]);
                         }
-                        if (expected != storageTextures[storageIndex]) return false;
+                        if (expected != storageTextures[storageIndex]) return miss("storage image", storageIndex, true);
                         ++storageIndex;
                     }
                 }
@@ -4956,9 +4993,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& table : tableStages) {
             if (table.elementTextures.empty()) continue;
             const auto* images = tableImages(shaders, table.stage);
-            if (images == nullptr || images->count != table.elementTextures.size()) return false;
+            if (images == nullptr || images->count != table.elementTextures.size()) return miss("image table of another size at texture", textureIndex);
             std::vector<std::shared_ptr<Texture>> cached;
-            if (auto* reused = FindReusedTable(context.device, *images, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
+            if (auto* reused = partial ? nullptr : FindReusedTable(context.device, *images, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
                 if (!reused->representatives.empty() && reused->representatives != variantRepresentatives(context.device, *images, table.elementBase, context.imageTableCapacity)) return false;
                 logTableLookups(*reused, cached);
                 auto next = cached.begin();
@@ -4982,23 +5019,30 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     same = index == textureIndex && textureIndex < textures.size() && textures[textureIndex] == texture;
                     ++textureIndex;
                 }
-                if (!same) return false;
+                if (!same) return miss("reused image table at texture", textureIndex);
                 TextureCounts().tablesReused.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            if (!table.representatives.empty() && table.representatives != variantRepresentatives(context.device, *images, table.elementBase, context.imageTableCapacity)) return false;
+            if (!table.representatives.empty() && table.representatives != variantRepresentatives(context.device, *images, table.elementBase, context.imageTableCapacity)) return miss("image table variants at texture", textureIndex);
             for (std::uint32_t element = 0; element < images->count; ++element) {
                 if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
                 if (!table.representatives.empty() && table.representatives[element] != NoRepresentative) continue;
-                if (table.elementTextures[element] != textureIndex || !currentTableEntry(*images, element)) return false;
+                if (skipped(textureIndex)) {
+                    if (table.elementTextures[element] != textureIndex) return miss("image table element order at texture", textureIndex);
+                    ++textureIndex;
+                    continue;
+                }
+                if (table.elementTextures[element] != textureIndex || !currentTableEntry(*images, element)) return miss("image table texture", textureIndex);
                 ++textureIndex;
             }
         }
-        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
+        if (textureIndex != textures.size()) return miss("texture count", textureIndex);
+        if (storageIndex != storageTextures.size()) return miss("storage image count", storageIndex, true);
         // The walk proved every object current again: the records move to what it proved, or one
         // spurious stamp (a label sharing a 64 KiB block with a surface's edge) would keep this
         // object on the full walk for good.
-        captureValidation(spaceReuse);
+        if (partial) lookupLog().clear();
+        else captureValidation(spaceReuse);
         return true;
     };
     struct OverlappingTag {};
@@ -5011,7 +5055,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     SpaceMark(SpacePhase::FirstFast);
     bool indexProved = false;
     std::uint64_t indexBaseline = 0;
-    if (GuestMemory::WriteIndexEnabled() && !noFast && EpochRevalidate()) {
+    if (!perUseTextures && GuestMemory::WriteIndexEnabled() && !noFast && EpochRevalidate()) {
         if (indexRevalidate(shaders, serialBefore) != IndexOutcome::Fallback) indexProved = true;
         else {
             if (writeSubscription == nullptr) subscribeIndex(shaders);
@@ -5060,7 +5104,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         countFullWalk(reason);
         SpaceMark(SpacePhase::Walk);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool walked = fullWalk();
+        const bool walked = fullWalk(false);
         SpaceEndPhase();
         SpaceSetWalkAttempted(walked);
         countFullWalkTime(reason, walkStart);
@@ -5090,7 +5134,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }
             for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
             SpaceMark(SpacePhase::DiagnosticWalk);
-            const bool same = fullWalk();
+            const bool same = fullWalk(false);
             SpaceEndPhase();
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (!same || moved != versions.end()) {
@@ -6370,7 +6414,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             RequireNonSeamlessCube(resource.dimension == TextureDimension::kCube, binding.imageSamplers[element], shaderSamplers);
             RequireDisablesDegammaOn(resource.format, binding.imageSamplers[element], shaderSamplers);
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
-            const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && (resource.dimension == TextureDimension::k2DArray || (depthCompare && resource.dimension == TextureDimension::k1DArray));
+            const bool firstLayer = (binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && (resource.dimension == TextureDimension::k2DArray || (depthCompare && resource.dimension == TextureDimension::k1DArray))) || (binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image1D && resource.dimension == TextureDimension::k1DArray);
             const bool depth1D = depthCompare && ((binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k1D) || (binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DArray && resource.dimension == TextureDimension::k1DArray));
             const bool firstSample = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DMsaa;
             const bool layerRows = layerRowsBinding(binding.imageShape, resource, depthCompare);
@@ -6825,7 +6869,7 @@ void ShaderResources::resolveImageTables() {
             const auto& resource = decoded.resource;
             const auto shape = binding.imageShapes.at(element);
             const bool depthCompare = element < binding.imageDepthCompare.size() && binding.imageDepthCompare[element];
-            decoded.firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && (resource.dimension == TextureDimension::k2DArray || (depthCompare && resource.dimension == TextureDimension::k1DArray));
+            decoded.firstLayer = (shape == ShaderRecompiler::DescriptorImageShape::Image2D && (resource.dimension == TextureDimension::k2DArray || (depthCompare && resource.dimension == TextureDimension::k1DArray))) || (shape == ShaderRecompiler::DescriptorImageShape::Image1D && resource.dimension == TextureDimension::k1DArray);
             const bool depth1D = depthCompare && ((shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k1D) || (shape == ShaderRecompiler::DescriptorImageShape::Image2DArray && resource.dimension == TextureDimension::k1DArray));
             if (!decoded.firstLayer && !depth1D && !MatchesGuestDimension(shape, resource.dimension)) {
                 decoded.rejected = "AGC graphics: guest texture dimension disagrees with the table entry's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")";
