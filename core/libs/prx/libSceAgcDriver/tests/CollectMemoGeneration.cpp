@@ -1085,6 +1085,10 @@ int main(int argc, char** argv) {
                 CheckCoverageThreadAndDriverWrites();
             } else if (selected == "--recheck-thread") {
                 CheckRecheckMissFallsThroughThreadMemo();
+            } else if (selected == "--prefetch") {
+                CheckPrefetchAnswersNextPeriod();
+                std::cout << "collect prefetch active test passed\n";
+                return 0;
             } else throw std::runtime_error("unknown collect coverage test");
             std::cout << "collect coverage test passed\n";
             return 0;
