@@ -2557,7 +2557,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.contentKey = resLookupTimed(resLookup, ResLookupSpan::Key, [&] {
             return plan.contentKey;
         });
-        auto cached = resLookupTimed(resLookup, ResLookupSpan::Find, [&] { return SharedResourceCache().Find(resolved.contentKey); });
+        auto cached = resLookupTimed(resLookup, ResLookupSpan::Find, [&] { return SharedResourceCache().Find(*resolved.contentKey); });
         resLookup.NoteFindHit(cached != nullptr);
         if (cached) {
             resLookup.SpanBegin();

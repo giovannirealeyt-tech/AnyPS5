@@ -5104,7 +5104,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         countFullWalk(reason);
         SpaceMark(SpacePhase::Walk);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool walked = fullWalk();
+        const bool walked = fullWalk(false);
         SpaceEndPhase();
         SpaceSetWalkAttempted(walked);
         countFullWalkTime(reason, walkStart);
@@ -5134,7 +5134,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }
             for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
             SpaceMark(SpacePhase::DiagnosticWalk);
-            const bool same = fullWalk();
+            const bool same = fullWalk(false);
             SpaceEndPhase();
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (!same || moved != versions.end()) {
