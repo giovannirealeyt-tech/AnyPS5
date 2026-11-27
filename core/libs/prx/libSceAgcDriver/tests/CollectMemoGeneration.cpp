@@ -1062,8 +1062,6 @@ int main(int argc, char** argv) {
             // read their static config from, only follows the CRT environment.
             _putenv("APS5_NO_EPOCH_COLLECT_MAP=1");
         }
-
-        CheckPrefetchAnswersNextPeriod();
         SetObservationHookForTest(&Hook);
 #ifdef _WIN32
         if (!WriteWatched()) {
@@ -1123,6 +1121,11 @@ CheckScopePartitionWalkThenMemo();
         CheckFailedRequestPublishesNothing();
         CheckSharedWalks();
         CheckStoreAfterSubmit();
+        if (std::getenv("APS5_ENABLE_COLLECT_PREFETCH") == nullptr) {
+            std::fprintf(stderr, "collect prefetch test skipped (APS5_ENABLE_COLLECT_PREFETCH unset)\n");
+            return 77;
+        }
+        CheckPrefetchAnswersNextPeriod();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;

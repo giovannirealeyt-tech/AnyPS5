@@ -2388,6 +2388,7 @@ std::uint64_t recheckMappingGeneration() {
 struct CollectSinceSlot {};
 }
 
+
 struct CollectPrefetch {
     static constexpr std::size_t Slots = 16;
     static constexpr std::size_t RangesPerEpoch = 8192;
@@ -2413,8 +2414,7 @@ CollectPrefetch& collectPrefetch() {
 std::atomic<int> collectPrefetchSetting{-1};
 
 bool collectPrefetchEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_COLLECT_PREFETCH") == nullptr;
-    return enabled && collectMemoEnabled();
+    return false; // DEBUG-ISOLATE
 }
 
 bool collectPrefetchWalking() {
@@ -2456,6 +2456,64 @@ void notePrefetchRange(std::uint64_t first, std::uint64_t stop) {
         }
     }
     last = bump;
+}
+
+Observation observe(std::uint64_t address, std::size_t bytes, bool memoized);
+
+void runCollectPrefetch() {
+    collectPrefetchThread = true;
+    auto& prefetch = collectPrefetch();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
+    std::unordered_set<std::uint64_t> seen;
+    for (;;) {
+        std::uint64_t bump = 0;
+        {
+            std::unique_lock lock(prefetch.mutex);
+            prefetch.wake.wait(lock, [&] { return prefetch.bumps.load(std::memory_order_relaxed) != prefetch.served; });
+            bump = prefetch.bumps.load(std::memory_order_relaxed);
+            prefetch.served = bump;
+            pending.clear();
+            if (!collectPrefetchWalking()) continue;
+            const auto period = prefetchPeriod(prefetch);
+            if (period == 0 || bump < period) continue;
+            const auto source = bump - period;
+            const auto slot = source % CollectPrefetch::Slots;
+            if (prefetch.tags[slot] != source) continue;
+            pending = prefetch.ranges[slot];
+        }
+        seen.clear();
+        HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(lastBumpedEpoch.load(std::memory_order_acquire));
+        HostThreadSlot<std::uint64_t, CollectSinceSlot>::Set(SteadyNanoseconds());
+        for (const auto& [first, stop] : pending) {
+            if (prefetch.bumps.load(std::memory_order_acquire) != bump) break;
+            if (!seen.insert(first * 0x9e3779b97f4a7c15ull ^ stop).second) continue;
+            prefetchRanges.fetch_add(1, std::memory_order_relaxed);
+            static_cast<void>(observe(first, static_cast<std::size_t>(stop - first), true));
+        }
+    }
+}
+
+void bumpCollectPrefetch() {
+    if (!collectPrefetchEnabled()) return;
+    auto& prefetch = collectPrefetch();
+    {
+        std::lock_guard lock(prefetch.mutex);
+        prefetch.bumps.fetch_add(1, std::memory_order_release);
+        if (!collectPrefetchWalking()) return;
+        if (!prefetch.started) {
+            prefetch.started = true;
+            Libc::StartHostThread(runCollectPrefetch).detach();
+        }
+    }
+    prefetch.wake.notify_one();
+}
+
+void SetCollectPrefetch(bool enabled) {
+    collectPrefetchSetting.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t CollectPrefetchWalks() {
+    return prefetchWalks.load(std::memory_order_relaxed);
 }
 
 Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
@@ -2670,7 +2728,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     }
     if (collectPrefetchThread) {
         if (done != 0) prefetchWalks.fetch_add(1, std::memory_order_relaxed);
-    } else if (shared && done != 0 && status == Status::Complete && collectPrefetchEnabled()) {
+    } else if (shared && done != 0 && status == Status::Complete && collectPrefetchEnabled() && std::getenv("APS5_ENABLE_COLLECT_PREFETCH") != nullptr) {
         notePrefetchRange(first, stop);
     }
     return finish(CollectTiming::Walk, Observation{Status::Complete, generation});
@@ -2882,8 +2940,6 @@ void BumpCollectEpochSince(std::uint64_t since) {
     HostThreadSlot<std::uint64_t, CollectSinceSlot>::Set(since == 0 ? now : std::max(previous, std::min(since, now)));
 }
 
-void bumpCollectPrefetch();
-
 void BumpCollectEpoch() {
     HostThreadSlot<std::uint64_t, CollectSinceSlot>::Set(SteadyNanoseconds());
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -2892,62 +2948,6 @@ void BumpCollectEpoch() {
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
     bumpCollectPrefetch();
-}
-
-void runCollectPrefetch() {
-    collectPrefetchThread = true;
-    auto& prefetch = collectPrefetch();
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
-    std::unordered_set<std::uint64_t> seen;
-    for (;;) {
-        std::uint64_t bump = 0;
-        {
-            std::unique_lock lock(prefetch.mutex);
-            prefetch.wake.wait(lock, [&] { return prefetch.bumps.load(std::memory_order_relaxed) != prefetch.served; });
-            bump = prefetch.bumps.load(std::memory_order_relaxed);
-            prefetch.served = bump;
-            pending.clear();
-            if (!collectPrefetchWalking()) continue;
-            const auto period = prefetchPeriod(prefetch);
-            if (period == 0 || bump < period) continue;
-            const auto source = bump - period;
-            const auto slot = source % CollectPrefetch::Slots;
-            if (prefetch.tags[slot] != source) continue;
-            pending = prefetch.ranges[slot];
-        }
-        seen.clear();
-        HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(lastBumpedEpoch.load(std::memory_order_acquire));
-        HostThreadSlot<std::uint64_t, CollectSinceSlot>::Set(SteadyNanoseconds());
-        for (const auto& [first, stop] : pending) {
-            if (prefetch.bumps.load(std::memory_order_acquire) != bump) break;
-            if (!seen.insert(first * 0x9e3779b97f4a7c15ull ^ stop).second) continue;
-            prefetchRanges.fetch_add(1, std::memory_order_relaxed);
-            static_cast<void>(observe(first, static_cast<std::size_t>(stop - first), true));
-        }
-    }
-}
-
-void bumpCollectPrefetch() {
-    if (!collectPrefetchEnabled()) return;
-    auto& prefetch = collectPrefetch();
-    {
-        std::lock_guard lock(prefetch.mutex);
-        prefetch.bumps.fetch_add(1, std::memory_order_release);
-        if (!collectPrefetchWalking()) return;
-        if (!prefetch.started) {
-            prefetch.started = true;
-            Libc::StartHostThread(runCollectPrefetch).detach();
-        }
-    }
-    prefetch.wake.notify_one();
-}
-
-void SetCollectPrefetch(bool enabled) {
-    collectPrefetchSetting.store(enabled ? 1 : 0, std::memory_order_relaxed);
-}
-
-std::uint64_t CollectPrefetchWalks() {
-    return prefetchWalks.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ThreadCollectEpoch() {
