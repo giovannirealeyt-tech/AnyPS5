@@ -19934,23 +19934,9 @@ void dataRunAccessTests(const Device& device, Recorder& recorder) {
     recorder.Submit();
     recorder.Sync();
     std::cout << "data run accesses checked\n";
-void detilerRetirementTests(const Device& device, Recorder& previous) {
-    auto context = device.GetContext();
-    DetilerReleaseProbe probe(context);
-    constexpr std::uint32_t side = 64;
-    const auto layout = ComputeMipLayout(TextureTileMode::kLinear, 56, side, side, 1).front();
-    Require(layout.pitchBytes == side * 4u && layout.tiledSize == layout.linearSize, "the linear detile fixture has a padded pitch");
-    const auto bytes = static_cast<std::size_t>(layout.linearSize);
-    Buffer source(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Buffer destination(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Buffer otherSource(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Buffer otherDestination(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    for (std::size_t index = 0; index < bytes; ++index) {
-        source.Bytes()[index] = static_cast<std::byte>((index * 7u + 3u) & 0xffu);
-        otherSource.Bytes()[index] = static_cast<std::byte>((index * 13u + 5u) & 0xffu);
-    }
-
 }
+
+
 
 int main(int argc, char** argv) {
     _ZSt13set_terminatePFvvE_nid_postfix([] {
