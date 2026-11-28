@@ -11903,6 +11903,7 @@ void aliasedBufferViewTests() {
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     for (const auto& [words, views] : cases) {
         auto request = orderedPixelRequest(0x20600u, capabilities, words);
+        request.target.fragmentShaderBarycentricEnabled = false;
         request.target.supportedExtensions = extensions;
         request.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
         request.context.userDataBaseRegister = 0;
