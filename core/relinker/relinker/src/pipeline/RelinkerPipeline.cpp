@@ -810,7 +810,6 @@ RelinkResult RelinkerPipeline::Relink() {
                 continue;
             }
             if (relType == R_X86_64_32) {
-                if (symIdx != 0) throw RelinkerException("R_X86_64_32 relocation with a symbol is not supported", pos);
                 appendRela(dynSection.RelaData, rOffset, static_cast<std::uint64_t>(relType), rAddend);
                 continue;
             }
