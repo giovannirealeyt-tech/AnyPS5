@@ -1989,14 +1989,18 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             result.layerExports = read(cx, 0x207) & (1u << 18u);
         }
         if (result.depth) result.renderExtent = {std::min(result.renderExtent.width, result.depth->extent.width), std::min(result.renderExtent.height, result.depth->extent.height)};
+        result.scissor = {{0, 0}, result.renderExtent};
     } else if (result.depth) {
         result.renderExtent = result.depth->extent;
+        result.scissor = {{0, 0}, result.renderExtent};
     } else {
         const auto screenBottomRight = read(cx, 0xd);
         APS5_LOG_OUT_DEBUG("No color target, screen BR register=0x%x", screenBottomRight);
-        result.renderExtent = {screenBottomRight & 0xffffu, screenBottomRight >> 16u};
+        const auto width = screenBottomRight & 0xffffu;
+        const auto height = screenBottomRight >> 16u;
+        result.scissor = {{0, 0}, {width, height}};
+        result.renderExtent = {std::max(1u, width), std::max(1u, height)};
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
-        Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
     result.quadSampleMask = decodeQuadSampleMask(cx, result.samples);
     result.pixelEarlyZ = !PixelProgramSkipped(queue) && PixelEarlyZ(read(cx, 0x203));
@@ -2042,7 +2046,6 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         result.depthBias = false;
     }
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", result.viewport.x, result.viewport.y, result.viewport.width, result.viewport.height, result.viewport.minDepth, result.viewport.maxDepth);
-    result.scissor = {{0, 0}, result.renderExtent};
     intersect(result.scissor, cx, 0xc, true);
     intersect(result.scissor, cx, 0x81, false);
     intersect(result.scissor, cx, 0x90, false);
