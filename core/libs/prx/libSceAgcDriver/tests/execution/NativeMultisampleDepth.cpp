@@ -1001,6 +1001,7 @@ void CheckGuardedWrite() {
 
 enum class PublicationUnmap { None, Middle, Head, Tail, EmptyDepth, EmptyStencil, EmptyHtile, Remap, Inaccessible };
 enum class PublicationClear { None, Clear, Redraw, Different, Stencil, StencilRedraw, StencilSameRedraw, QueuedStencilRedraw };
+enum class PublicationClearTiming { Eager, Deferred, DeferredQueued };
 std::barrier<>* publicationReadBarrier = nullptr;
 std::function<void(DepthPublicationStage)> publicationAction;
 
@@ -1030,7 +1031,7 @@ private:
     std::jthread watcher;
 };
 
-void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWrite write, bool depthOnly, PublicationUnmap unmap = PublicationUnmap::None, PublicationClear clear = PublicationClear::None, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>* gpuLock = nullptr) {
+void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWrite write, bool depthOnly, PublicationUnmap unmap = PublicationUnmap::None, PublicationClear clear = PublicationClear::None, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>* gpuLock = nullptr, PublicationClearTiming timing = PublicationClearTiming::Eager) {
     constexpr VkExtent2D extent{129u, 3u};
     const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
     const auto stencilBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 1u, samples));
@@ -1105,14 +1106,17 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
         Require(DepthSurfaceView(context, target) == view, "publication clear replaced its native attachment");
         if (stencilFill) {
             NoteDepthMetadataFill(target.stencilAddress, stencilBytes, target.clearStencil * 0x01010101u);
-            if (clear == PublicationClear::QueuedStencilRedraw) QueueTargetWordFill(context, recorder, target.stencilAddress, stencilBytes, target.clearStencil * 0x01010101u);
+            if (clear == PublicationClear::QueuedStencilRedraw || timing == PublicationClearTiming::DeferredQueued) QueueTargetWordFill(context, recorder, target.stencilAddress, stencilBytes, target.clearStencil * 0x01010101u);
             else AgcDriver::GuestMemory::StoreOwnBytes(target.stencilAddress, stencilBytes, [&] { std::memset(stencil.Data(), target.clearStencil, stencilBytes); });
         } else {
             const std::uint32_t word = clear == PublicationClear::Different ? (depthOnly ? 0xfffffff0u : 0xfffc0000u) : 0u;
             NoteDepthMetadataFill(target.htileAddress, metadataBytes, word);
-            AgcDriver::GuestMemory::StoreOwnBytes(target.htileAddress, metadataBytes, [&] { for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) std::memcpy(metadata.Data() + offset, &word, 4u); });
+            if (timing == PublicationClearTiming::DeferredQueued) QueueTargetWordFill(context, recorder, target.htileAddress, metadataBytes, word);
+            else AgcDriver::GuestMemory::StoreOwnBytes(target.htileAddress, metadataBytes, [&] { for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) std::memcpy(metadata.Data() + offset, &word, 4u); });
         }
-        Require(DepthSurfaceView(context, target) == view, "publication did not apply its native clear in place");
+        if (timing == PublicationClearTiming::Eager) {
+            Require(DepthSurfaceView(context, target) == view, "publication did not apply its native clear in place");
+        }
         if (redraw) {
             NoteDepthSurfaceWrite(context, target);
             raster->Run(recorder.Commands(), 0.5f);
@@ -1524,7 +1528,7 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
             Require(std::equal(excluded[index].begin(), excluded[index].end(), reinterpret_cast<const std::byte*>(addresses[index] + begin)), "native D32S8 publication wrote an unmapped or remapped hole");
         }
     }
-    std::printf("Native D32S8 publication samples=%u write=%u depthOnly=%u unmap=%u clear=%u checked\n", samples, static_cast<std::uint32_t>(write), depthOnly, static_cast<std::uint32_t>(unmap), static_cast<std::uint32_t>(clear));
+    std::printf("Native D32S8 publication samples=%u write=%u depthOnly=%u unmap=%u clear=%u clearTiming=%u checked\n", samples, static_cast<std::uint32_t>(write), depthOnly, static_cast<std::uint32_t>(unmap), static_cast<std::uint32_t>(clear), static_cast<std::uint32_t>(timing));
 }
 
 std::array<std::uint32_t, 8> StencilSampleWords(const DepthTarget& target) {
@@ -2397,7 +2401,7 @@ void CheckStencilTarget(Context context, std::uint32_t fragments, bool one, bool
     std::printf("Native depth-stencil samples=%u clear=%u fill=%u: imported, stencil-tested, sampled%s\n", fragments, one, filling, filling ? " and refilled three times" : "");
 }
 
-enum class PlaneFault { None, StencilByte, StencilWrite, UnwatchedStencil, HtileWord, PartialStencilFill, StencilFillPattern, StencilFillUnstored, StencilFillCpuWrite, StencilFillStoredFirst, StencilSameValueStore, StencilOtherValueStore };
+enum class PlaneFault { None, StencilByte, StencilWrite, UnwatchedStencil, HtileWord, PartialStencilFill, UnmappedPartialStencilFill, StencilFillPattern, StencilFillUnstored, StencilFillCpuWrite, StencilFillStoredFirst, StencilSameValueStore, StencilOtherValueStore, UnmappedPartialHtileFill };
 enum class PlaneFill { None, Htile, Stencil, Both };
 
 void CheckSeparateStencilTarget(Context context, std::uint32_t fragments, bool one, PlaneFill fill, PlaneFault fault = PlaneFault::None, bool pipeAligned = true) {
@@ -2490,6 +2494,16 @@ void CheckSeparateStencilTarget(Context context, std::uint32_t fragments, bool o
         sample(fetch, &hit, 0.25f, 0.25f);
         sample(bareFetch, nullptr, 0.0f, 0.25f);
     }
+    if (fault == PlaneFault::UnmappedPartialHtileFill) {
+        RetireUnmappedDepth_nid_no_patch(target.htileAddress, metadataBytes);
+        NoteDepthMetadataFill(target.htileAddress, metadataBytes - 4u, clearWord);
+        Require(CachedSampledTexture(context, words) == texture, "a fill over an unmapped HTILE plane replaced the sampled view");
+        sample(fetch, nullptr, 0.0f, 0.25f);
+        NoteDepthMetadataFill(target.htileAddress, metadataBytes, clearWord);
+        Require(CachedSampledTexture(context, words) == texture, "a whole fill over an unmapped HTILE plane replaced the sampled view");
+        sample(fetch, nullptr, 0.0f, 0.25f);
+        sample(bareFetch, nullptr, 0.0f, 0.25f);
+    }
     const bool htileFill = fill == PlaneFill::Htile || fill == PlaneFill::Both;
     const bool stencilFill = fill == PlaneFill::Stencil || fill == PlaneFill::Both;
     const std::uint8_t stencilValue = one ? 0x11u : 0u;
@@ -2501,26 +2515,28 @@ void CheckSeparateStencilTarget(Context context, std::uint32_t fragments, bool o
             AgcDriver::GuestMemory::StoreOwnBytes(target.htileAddress, metadataBytes, setWords);
         }
         if (stencilFill) {
-            const auto fillBytes = fault == PlaneFault::PartialStencilFill ? stencilBytes / 2u : stencilBytes;
+            const auto fillBytes = fault == PlaneFault::PartialStencilFill || fault == PlaneFault::UnmappedPartialStencilFill ? stencilBytes / 2u : stencilBytes;
             const std::uint32_t pattern = fault == PlaneFault::StencilFillPattern ? 0x00010001u : stencilValue * 0x01010101u;
             const auto storeStencil = [&] { AgcDriver::GuestMemory::StoreOwnBytes(stencil.Address(), fillBytes, [&] { std::memset(stencil.Data(), stencilValue, fillBytes); }); };
             if (fault == PlaneFault::StencilFillStoredFirst) storeStencil();
+            if (fault == PlaneFault::UnmappedPartialStencilFill) RetireUnmappedDepth_nid_no_patch(stencil.Address(), stencilBytes);
             NoteDepthMetadataFill(stencil.Address(), fillBytes, pattern);
-            if (fault != PlaneFault::StencilFillUnstored && fault != PlaneFault::StencilFillStoredFirst) storeStencil();
+            if (fault != PlaneFault::StencilFillUnstored && fault != PlaneFault::StencilFillStoredFirst && fault != PlaneFault::UnmappedPartialStencilFill) storeStencil();
             if (fault == PlaneFault::StencilFillCpuWrite) stencil.Data()[stencilBytes - 1u] ^= std::byte{0x01};
         }
         Require(CachedSampledTexture(context, words) == texture, "a whole-plane fill replaced the sampled view of a target with a separate stencil plane");
         recorder.Sync();
         if (htileFill) sample(fetch, nullptr, 0.0f, std::nullopt);
         else sample(fetch, nullptr, 0.0f, 0.125f);
-        const std::uint8_t expected = stencilFill ? stencilValue : 0xc3u;
+        const std::uint8_t expected = stencilFill && fault != PlaneFault::UnmappedPartialStencilFill ? stencilValue : 0xc3u;
         const DepthRaster kept(context, target, view, StencilUse{VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, expected});
         sample(fetch, &kept, 0.25f, 0.25f);
         const DepthRaster other(context, target, view, StencilUse{VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, static_cast<std::uint8_t>(expected == 0xc3u ? clearStencil : 0xc3u)});
         sample(fetch, &other, 0.375f, 0.25f);
         sample(bareFetch, nullptr, 0.0f, 0.25f);
     }
-    if (stencilFill) Require(std::all_of(stencil.Data(), stencil.Data() + stencilBytes, [&](auto value) { return value == std::byte{stencilValue}; }), "native depth sampling with a separate stencil plane changed the filled guest stencil plane");
+    if (stencilFill && fault == PlaneFault::UnmappedPartialStencilFill) Require(std::equal(imported.begin(), imported.end(), stencil.Data()), "a fill over an unmapped stencil plane changed the guest stencil bytes");
+    else if (stencilFill) Require(std::all_of(stencil.Data(), stencil.Data() + stencilBytes, [&](auto value) { return value == std::byte{stencilValue}; }), "native depth sampling with a separate stencil plane changed the filled guest stencil plane");
     else Require(std::equal(imported.begin(), imported.end(), stencil.Data()), "native depth sampling with a separate stencil plane changed the guest stencil plane");
     bare.reset();
     texture.reset();
@@ -5687,9 +5703,16 @@ int main(int argc, char** argv) {
                 for (const bool depthOnly : {false, true}) {
                     for (const auto clear : {PublicationClear::Clear, PublicationClear::Redraw}) CheckDepthPublication(publishing, samples, PublicationWrite::Pages, depthOnly, PublicationUnmap::None, clear);
                     for (const auto clear : {PublicationClear::Clear, PublicationClear::Redraw, PublicationClear::Different}) CheckDepthPublication(publishing, samples, PublicationWrite::None, depthOnly, PublicationUnmap::None, clear);
+                    for (const auto timing : {PublicationClearTiming::Deferred, PublicationClearTiming::DeferredQueued}) {
+                        CheckDepthPublication(publishing, samples, PublicationWrite::None, depthOnly, PublicationUnmap::None, PublicationClear::Clear, nullptr, timing);
+                    }
                 }
                 CheckDepthPublication(publishing, samples, PublicationWrite::None, true, PublicationUnmap::None, PublicationClear::StencilRedraw);
+                for (const auto timing : {PublicationClearTiming::Deferred, PublicationClearTiming::DeferredQueued}) {
+                    CheckDepthPublication(publishing, samples, PublicationWrite::None, true, PublicationUnmap::None, PublicationClear::Stencil, nullptr, timing);
+                }
             }
+            TargetRefuses([&] { CheckDepthPublication(publishing, 4u, PublicationWrite::Pages, false, PublicationUnmap::None, PublicationClear::Clear, nullptr, PublicationClearTiming::Deferred); }, "guest writes over native multisample depth");
             for (const auto clear : {PublicationClear::Stencil, PublicationClear::StencilSameRedraw, PublicationClear::QueuedStencilRedraw}) CheckDepthPublication(publishing, 4u, PublicationWrite::None, true, PublicationUnmap::None, clear);
             CheckGuardedWrite();
             for (const auto write : {PublicationWrite::CopyRace, PublicationWrite::Retired, PublicationWrite::ColorAcquisition, PublicationWrite::DrawAlias, PublicationWrite::DrawPending, PublicationWrite::DriverSameDepth, PublicationWrite::DriverSameStencil, PublicationWrite::DriverSameHtile}) CheckDepthPublication(publishing, 4u, write, true);
@@ -6034,6 +6057,10 @@ int main(int argc, char** argv) {
             }
             CheckSeparateStencilTarget(context, 4u, true, PlaneFill::Stencil, PlaneFault::StencilFillStoredFirst, false);
             std::puts("Native depth with a separate stencil plane accepted a fill stored before its note");
+            CheckSeparateStencilTarget(context, 4u, true, PlaneFill::Stencil, PlaneFault::UnmappedPartialStencilFill, false);
+            std::puts("Native depth with a separate stencil plane ignored a partial fill over its unmapped stencil plane");
+            CheckSeparateStencilTarget(context, 4u, true, PlaneFill::None, PlaneFault::UnmappedPartialHtileFill, false);
+            std::puts("Native depth with a separate stencil plane ignored a partial fill over its unmapped HTILE");
             for (const auto samples : {2u, 4u, 8u}) {
                 if (!supported(samples)) { unavailable += 4u; continue; }
                 for (const auto path : {GhostFill::Stored, GhostFill::QueuedAfterNote, GhostFill::QueuedBeforeNote, GhostFill::QueuedNotedTwice}) { CheckGhostSequence(context, samples, path); ++checked; }
