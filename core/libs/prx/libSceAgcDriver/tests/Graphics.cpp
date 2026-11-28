@@ -10429,7 +10429,13 @@ void barycentricEmulationTests() {
         request.target.vulkanVersion = 0x00401000u;
         request.target.spirvVersion = 0x00010300u;
         request.target.subgroupSize = 64;
-        request.target.fragmentShaderBarycentricEnabled = barycentric;
+        request.target.fragmentShaderBarycentricEnabled = barycentric || builtins;
+        if (barycentric || builtins) {
+            static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+            static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+            request.target.supportedCapabilities = capabilities;
+            request.target.supportedExtensions = extensions;
+        }
         request.target.fragmentBarycentricBuiltins = builtins;
         request.layout.pushConstantSizeBytes = 128;
         request.useCache = false;
