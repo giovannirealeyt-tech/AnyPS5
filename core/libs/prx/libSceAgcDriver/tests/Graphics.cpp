@@ -10488,11 +10488,21 @@ void barycentricEmulationTests() {
     for (const auto& code : {std::span<const std::uint32_t>(readsIj), std::span<const std::uint32_t>(interpolatesAndReadsIj)}) {
         const auto builtin = compile(code, false, 0xffffffffu, true);
         const auto builtinDecorations = decorations(builtin, spv::DecorationBuiltIn);
-        Require(!builtin.barycentricEmulation.active && barycentricCapability(builtin) && std::find(builtinDecorations.begin(), builtinDecorations.end(), static_cast<std::uint32_t>(spv::BuiltInBaryCoordKHR)) != builtinDecorations.end() && decorations(builtin, spv::DecorationPerVertexKHR).empty(), "reading the I/J VGPRs with barycentric built-ins did not use BaryCoordKHR");
-        Require(std::ranges::none_of(builtin.fragmentParameters, [](const FragmentParameter& parameter) { return parameter.perVertex; }), "barycentric built-ins made a parameter per-vertex");
+        const auto hasBaryCoord = std::find(builtinDecorations.begin(), builtinDecorations.end(), static_cast<std::uint32_t>(spv::BuiltInBaryCoordKHR)) != builtinDecorations.end();
+        const auto perVertexDecorations = decorations(builtin, spv::DecorationPerVertexKHR);
+        Require(!builtin.barycentricEmulation.active && barycentricCapability(builtin) && hasBaryCoord, "reading the I/J VGPRs with barycentric built-ins did not emit BaryCoordKHR");
+        if (code[0] == 0xc8080000u) {
+            Require(!perVertexDecorations.empty() && std::ranges::any_of(builtin.fragmentParameters, [](const FragmentParameter& parameter) { return parameter.perVertex; }), "the mixed interpolation path lost the per-vertex input it interpolates with BaryCoordKHR");
+        } else {
+            Require(perVertexDecorations.empty() && std::ranges::none_of(builtin.fragmentParameters, [](const FragmentParameter& parameter) { return parameter.perVertex; }), "the I/J-only path decorated a parameter per-vertex");
+        }
     }
     Require(compile(interpolatesAndReadsIj, false).barycentricEmulation.active, "reading the I/J VGPRs next to v_interp_p1/p2 without the extension did not emulate barycentrics");
-    Require(compile(readsVertex, false, 0xffffffffu, true).barycentricEmulation.active, "v_interp_mov of P10 with only barycentric built-ins did not emulate per-vertex parameters");
+    {
+        const auto rv = compile(readsVertex, false, 0xffffffffu, true);
+        const auto rvPerV = decorations(rv, spv::DecorationPerVertexKHR);
+        Require(!rv.barycentricEmulation.active && barycentricCapability(rv) && !rvPerV.empty() && std::any_of(rv.fragmentParameters.begin(), rv.fragmentParameters.end(), [](const FragmentParameter& p) { return p.perVertex; }), "v_interp_mov of P10 with only barycentric built-ins lost its native per-vertex parameter");
+    }
     fragment = compile(readsVertex, false);
     Require(fragment.barycentricEmulation.active && !fragment.barycentricEmulation.smooth && fragment.fragmentParameters.size() == 1u && fragment.fragmentParameters[0].perVertex, "v_interp_mov of P10 did not emulate per-vertex parameters");
     Require(decorations(fragment, spv::DecorationLocation) == std::vector<std::uint32_t>{0u} && decorations(fragment, spv::DecorationPerVertexKHR).empty() && !decorations(fragment, spv::DecorationFlat).empty() && !barycentricCapability(fragment), "the emulated per-vertex parameter was not a flat array at the first free location");
