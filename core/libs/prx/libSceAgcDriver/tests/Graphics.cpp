@@ -12892,6 +12892,7 @@ void unorm4_4_4_4TargetTests() {
         counting.context.pixel->iteratesSamples = true;
         counting.context.pixel->earlyZ = true;
         counting.target = merging.target;
+        counting.target.fragmentShaderBarycentricEnabled = false;
         counting.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
         static const std::array<std::uint32_t, 6> atomicCapabilities{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityStorageImageReadWithoutFormat, spv::CapabilityStorageImageMultisample, spv::CapabilityInterpolationFunction, spv::CapabilityInt64};
         counting.target.supportedCapabilities = atomicCapabilities;
