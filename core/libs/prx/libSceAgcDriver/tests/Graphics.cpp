@@ -2882,6 +2882,8 @@ void DepthStencilTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");
     queue.context[0x200] = 0x00200111;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");
+    queue.context[0x200] = 0x00200611;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");
     queue.context[0x200] = 0x00200211;
     queue.context[0x10c] = 0x05ff0f02;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");

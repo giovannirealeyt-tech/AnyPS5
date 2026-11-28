@@ -429,9 +429,28 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
                     return VK_STENCIL_OP_REPLACE;
                 }
                 const auto value = op == 2 ? 0xffu : op == 3 ? test : opValue;
-                if (((reference ^ value) & fixed & face.writeMask) != 0) {
-                    std::snprintf(detail, sizeof(detail), "AGC graphics: stencil replacement 0x%02x against test value 0x%02x (masks 0x%02x/0x%02x) is unsupported", value, test, face.compareMask, face.writeMask);
-                    throw std::runtime_error(detail);
+                const auto differing = (reference ^ value) & fixed & face.writeMask;
+                if (differing != 0) {
+                    const auto fixedHere = compare == 2 ? (!testFailed ? face.compareMask : 0u)
+                                        : compare == 5 ? (testFailed ? face.compareMask : 0u)
+                                        : compare == 3 ? (!testFailed && test == 0xffu ? face.compareMask : 0u)
+                                        : compare == 6 ? (!testFailed && test == 0u ? face.compareMask : 0u)
+                                        : compare == 4 ? (testFailed && test == 0xffu ? face.compareMask : 0u)
+                                        : compare == 1 ? (testFailed && test == 0u ? face.compareMask : 0u)
+                                        : 0u;
+                    if ((face.writeMask & ~fixedHere) != 0) {
+                        std::snprintf(detail, sizeof(detail), "AGC graphics: stencil replacement 0x%02x against test value 0x%02x (masks 0x%02x/0x%02x) is unsupported", value, test, face.compareMask, face.writeMask);
+                        throw std::runtime_error(detail);
+                    }
+                    if (invertMask == 0) {
+                        invertMask = differing;
+                    } else if (invertMask != differing) {
+                        std::snprintf(detail, sizeof(detail), "AGC graphics: stencil replacement 0x%02x against test value 0x%02x (masks 0x%02x/0x%02x) is unsupported", value, test, face.compareMask, face.writeMask);
+                        throw std::runtime_error(detail);
+                    }
+                    ++inverted;
+                    fixed |= face.writeMask;
+                    return VK_STENCIL_OP_INVERT;
                 }
                 reference = (reference & ~face.writeMask) | (value & face.writeMask);
                 fixed |= face.writeMask;
