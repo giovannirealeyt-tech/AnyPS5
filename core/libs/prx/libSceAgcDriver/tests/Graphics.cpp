@@ -1536,6 +1536,10 @@ std::vector<spv::BuiltIn> pixelBuiltinsRead(std::uint32_t ena, std::uint32_t add
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = true;
+    static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
@@ -1603,6 +1607,12 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled, 
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = barycentricEnabled;
+    if (barycentricEnabled) {
+        static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+        static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+    }
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
@@ -13786,6 +13796,10 @@ bool recompilesDebugBranch(std::uint32_t opcode) {
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = true;
+    static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
