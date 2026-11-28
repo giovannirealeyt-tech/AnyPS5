@@ -32,7 +32,7 @@ PeRelocations WindowsRelocationBuilder::Apply(WindowsLoadImage& image, const Dom
                 throw Domain::RelinkerException("Relocation target address overflow", target);
             const auto rva = image.GetRva(target, 8);
             const auto applied = entries.find(target);
-            if (applied != entries.end() && applied->second == std::pair{info, addend}) continue;
+            if (applied != entries.end()) continue;
             const auto next = ranges.lower_bound(target);
             if ((next != ranges.end() && next->first < target + 8) || (next != ranges.begin() && std::prev(next)->second > target))
                 throw Domain::RelinkerException("Overlapping ELF relocation targets", target);

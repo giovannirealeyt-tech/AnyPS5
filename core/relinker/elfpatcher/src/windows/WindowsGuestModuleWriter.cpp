@@ -18,6 +18,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
     using namespace Windows;
     WindowsLoadImage image(guest.Bytes, guest.Headers, false);
     std::vector<std::uint32_t> relocations;
+    std::vector<std::uint32_t> low32Targets;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tlsModules;
     const auto apply = [&](const std::vector<std::uint8_t>& table) {
         for (std::size_t offset = 0; offset < table.size(); offset += 24) {
@@ -66,6 +67,13 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
                     image.WritePointer(target, 0);
                     runtime.Imports.push_back({symbol.Name, rva, addend, 1, symbol.Library, type == 7 || (type == 6 && (symbol.Info & 15) == 2), (symbol.Info >> 4) == 2});
                 }
+            } else if (type == 10) {
+                if (symbolIndex != 0) throw Domain::RelinkerException("R_X86_64_32 relocation with a defined symbol is not supported for this target", target);
+                const auto relocated = image.GetRelocatedAddress(addend);
+                if (relocated > 0xffffffffu) throw Domain::RelinkerException("R_X86_64_32 relocated value does not fit in 32 bits", target);
+                image.RequireWritable(target, 4);
+                image.WritePointer32(target, static_cast<std::uint32_t>(relocated));
+                low32Targets.push_back(rva);
             } else throw Domain::RelinkerException("Unsupported Windows guest relocation " + std::to_string(type), target);
         }
     };
@@ -172,7 +180,7 @@ std::vector<std::uint8_t> GuestModuleWriter::WriteWindows(const Relinker::GuestI
         nextRva = AlignRva(nextRva + imports.Section.Data.size());
         sections.push_back(std::move(imports.Section));
     }
-    auto relocationData = WindowsRelocationBuilder().BuildBaseRelocations(relocations);
+    auto relocationData = WindowsRelocationBuilder().BuildBaseRelocations(relocations, low32Targets);
     if (!relocationData.empty()) {
         directories[5] = {nextRva, CheckedRva(relocationData.size())};
         sections.push_back({".reloc", nextRva, SectionRead | 0x02000040u, std::move(relocationData)});

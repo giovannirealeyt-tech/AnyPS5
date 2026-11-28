@@ -118,7 +118,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(std::vector<std::uint8_t> sour
         writeGotStub(sections, lazyStub.TargetRva, lazyStub.StubRva, image.GetImageBase());
         relocations.BaseRelocations.push_back(lazyStub.TargetRva);
     }
-    auto relocationData = fixedBase ? std::vector<std::uint8_t>{} : relocationBuilder.BuildBaseRelocations(relocations.BaseRelocations);
+    auto relocationData = fixedBase ? std::vector<std::uint8_t>{} : relocationBuilder.BuildBaseRelocations(relocations.BaseRelocations, relocations.Base32Relocations);
     if (!relocationData.empty()) {
         directories[5] = {nextRva, CheckedRva(relocationData.size())};
         sections.push_back({".reloc", nextRva, SectionRead | 0x02000040u, std::move(relocationData)});
