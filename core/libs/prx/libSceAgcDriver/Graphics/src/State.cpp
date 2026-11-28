@@ -83,6 +83,12 @@ float readFloat(const Registers& registers, std::uint32_t offset) {
     return value;
 }
 
+float readDepthBound(const Registers& registers, std::uint32_t offset) {
+    const auto value = std::bit_cast<float>(read(registers, offset));
+    if (std::isnan(value)) Require(false, "NaN depth bound at DWORD " + std::to_string(offset));
+    return value;
+}
+
 std::string zeroMessage(std::uint32_t offset, std::uint32_t value, const char* name) {
     char detail[64];
     std::snprintf(detail, sizeof(detail), " (register 0x%x = 0x%08x)", offset, value);
@@ -429,9 +435,28 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
                     return VK_STENCIL_OP_REPLACE;
                 }
                 const auto value = op == 2 ? 0xffu : op == 3 ? test : opValue;
-                if (((reference ^ value) & fixed & face.writeMask) != 0) {
-                    std::snprintf(detail, sizeof(detail), "AGC graphics: stencil replacement 0x%02x against test value 0x%02x (masks 0x%02x/0x%02x) is unsupported", value, test, face.compareMask, face.writeMask);
-                    throw std::runtime_error(detail);
+                const auto differing = (reference ^ value) & fixed & face.writeMask;
+                if (differing != 0) {
+                    const auto fixedHere = compare == 2 ? (!testFailed ? face.compareMask : 0u)
+                                        : compare == 5 ? (testFailed ? face.compareMask : 0u)
+                                        : compare == 3 ? (!testFailed && test == 0xffu ? face.compareMask : 0u)
+                                        : compare == 6 ? (!testFailed && test == 0u ? face.compareMask : 0u)
+                                        : compare == 4 ? (testFailed && test == 0xffu ? face.compareMask : 0u)
+                                        : compare == 1 ? (testFailed && test == 0u ? face.compareMask : 0u)
+                                        : 0u;
+                    if ((face.writeMask & ~fixedHere) != 0) {
+                        std::snprintf(detail, sizeof(detail), "AGC graphics: stencil replacement 0x%02x against test value 0x%02x (masks 0x%02x/0x%02x) is unsupported", value, test, face.compareMask, face.writeMask);
+                        throw std::runtime_error(detail);
+                    }
+                    if (invertMask == 0) {
+                        invertMask = differing;
+                    } else if (invertMask != differing) {
+                        std::snprintf(detail, sizeof(detail), "AGC graphics: stencil replacement 0x%02x against test value 0x%02x (masks 0x%02x/0x%02x) is unsupported", value, test, face.compareMask, face.writeMask);
+                        throw std::runtime_error(detail);
+                    }
+                    ++inverted;
+                    fixed |= face.writeMask;
+                    return VK_STENCIL_OP_INVERT;
                 }
                 reference = (reference & ~face.writeMask) | (value & face.writeMask);
                 fixed |= face.writeMask;
@@ -603,8 +628,8 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     result.depthBoundsTest = (depthControl & 8u) != 0;
     if (result.depthBoundsTest) {
         Require(zFormat != 0, "depth bounds without a depth plane");
-        result.minDepthBounds = readFloat(cx, 0x008);
-        result.maxDepthBounds = readFloat(cx, 0x009);
+        result.minDepthBounds = readDepthBound(cx, 0x008);
+        result.maxDepthBounds = readDepthBound(cx, 0x009);
     }
     if (depthClear) {
         result.depthTest = true;
@@ -1391,7 +1416,7 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         const auto outputType = read(queue.context, 0x29b);
         validate(outputType == 2 || ((outputType == 0 || outputType == 1) && !vertexWorkgroup), "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a point list or line strip from a geometry program, is unsupported");
         const auto outputSize = outputType == 0 ? 1u : outputType == 1 ? 2u : 3u;
-        validate((inputPrimitive == 1 || inputPrimitive == 2 || inputPrimitive == 3 || inputPrimitive == 4 || inputPrimitive == 5 || inputPrimitive == 6) && verticesPerPrimitive >= outputSize, "unsupported geometry input or output assembly");
+        validate((inputPrimitive == 1 || inputPrimitive == 2 || inputPrimitive == 4 || inputPrimitive == 5 || inputPrimitive == 6) && verticesPerPrimitive >= outputSize, "unsupported geometry input or output assembly");
         ShaderRecompiler::ShaderMeshInputInfo input;
         input.inputPrimitive = inputPrimitive;
         const auto inputSize = input.InputPrimitiveSize();
@@ -1964,14 +1989,18 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             result.layerExports = read(cx, 0x207) & (1u << 18u);
         }
         if (result.depth) result.renderExtent = {std::min(result.renderExtent.width, result.depth->extent.width), std::min(result.renderExtent.height, result.depth->extent.height)};
+        result.scissor = {{0, 0}, result.renderExtent};
     } else if (result.depth) {
         result.renderExtent = result.depth->extent;
+        result.scissor = {{0, 0}, result.renderExtent};
     } else {
         const auto screenBottomRight = read(cx, 0xd);
         APS5_LOG_OUT_DEBUG("No color target, screen BR register=0x%x", screenBottomRight);
-        result.renderExtent = {screenBottomRight & 0xffffu, screenBottomRight >> 16u};
+        const auto width = screenBottomRight & 0xffffu;
+        const auto height = screenBottomRight >> 16u;
+        result.scissor = {{0, 0}, {width, height}};
+        result.renderExtent = {std::max(1u, width), std::max(1u, height)};
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
-        Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
     result.quadSampleMask = decodeQuadSampleMask(cx, result.samples);
     result.pixelEarlyZ = !PixelProgramSkipped(queue) && PixelEarlyZ(read(cx, 0x203));
@@ -2017,7 +2046,6 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         result.depthBias = false;
     }
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", result.viewport.x, result.viewport.y, result.viewport.width, result.viewport.height, result.viewport.minDepth, result.viewport.maxDepth);
-    result.scissor = {{0, 0}, result.renderExtent};
     intersect(result.scissor, cx, 0xc, true);
     intersect(result.scissor, cx, 0x81, false);
     intersect(result.scissor, cx, 0x90, false);
@@ -2387,6 +2415,7 @@ std::array<std::uint16_t, 4> QuadSampleMasks(const State& state) {
 ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
     if (state.rectList) return ShaderRecompiler::RasterPrimitive::Rectangle;
     if (state.stages.mesh.has_value() && state.stages.mesh->outputPrimitiveSize == 2u) return ShaderRecompiler::RasterPrimitive::Line;
+    if (state.stages.mesh.has_value() && state.stages.mesh->outputPrimitiveSize == 1u) return ShaderRecompiler::RasterPrimitive::Point;
     if (state.stages.mesh.has_value() || state.stages.tessellation.has_value()) return ShaderRecompiler::RasterPrimitive::Triangle;
     switch (state.topology) {
         case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return ShaderRecompiler::RasterPrimitive::Point;
@@ -3041,7 +3070,9 @@ std::string NullPixelProgramRejection(const QueueState& queue) {
     const auto targetMask = find(queue.context, 0x8e);
     const auto shaderMask = find(queue.context, 0x8f);
     if (targetMask == queue.context.end() || shaderMask == queue.context.end()) return "AGC graphics: a draw without a pixel program needs CB_TARGET_MASK and CB_SHADER_MASK";
-    if (ColorWriteMask(queue.context) != 0) return "AGC graphics: a draw without a pixel program writes color";
+    const auto colorControl = find(queue.context, 0x202);
+    const bool colorWritesDisabled = colorControl != queue.context.end() && ((colorControl->second >> 4u) & 7u) == 0u;
+    if (!colorWritesDisabled && ColorWriteMask(queue.context) != 0) return "AGC graphics: a draw without a pixel program writes color";
     return {};
 }
 

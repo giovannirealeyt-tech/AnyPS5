@@ -1536,6 +1536,10 @@ std::vector<spv::BuiltIn> pixelBuiltinsRead(std::uint32_t ena, std::uint32_t add
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = true;
+    static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
@@ -1603,6 +1607,12 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled, 
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = barycentricEnabled;
+    if (barycentricEnabled) {
+        static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+        static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+    }
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
@@ -2881,6 +2891,8 @@ void DepthStencilTests() {
     queue.context[0x10b] = 0x40;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");
     queue.context[0x200] = 0x00200111;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");
+    queue.context[0x200] = 0x00200611;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "stencil replacement");
     queue.context[0x200] = 0x00200211;
     queue.context[0x10c] = 0x05ff0f02;
@@ -10417,7 +10429,13 @@ void barycentricEmulationTests() {
         request.target.vulkanVersion = 0x00401000u;
         request.target.spirvVersion = 0x00010300u;
         request.target.subgroupSize = 64;
-        request.target.fragmentShaderBarycentricEnabled = barycentric;
+        request.target.fragmentShaderBarycentricEnabled = barycentric || builtins;
+        if (barycentric || builtins) {
+            static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+            static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+            request.target.supportedCapabilities = capabilities;
+            request.target.supportedExtensions = extensions;
+        }
         request.target.fragmentBarycentricBuiltins = builtins;
         request.layout.pushConstantSizeBytes = 128;
         request.useCache = false;
@@ -10470,11 +10488,21 @@ void barycentricEmulationTests() {
     for (const auto& code : {std::span<const std::uint32_t>(readsIj), std::span<const std::uint32_t>(interpolatesAndReadsIj)}) {
         const auto builtin = compile(code, false, 0xffffffffu, true);
         const auto builtinDecorations = decorations(builtin, spv::DecorationBuiltIn);
-        Require(!builtin.barycentricEmulation.active && barycentricCapability(builtin) && std::find(builtinDecorations.begin(), builtinDecorations.end(), static_cast<std::uint32_t>(spv::BuiltInBaryCoordKHR)) != builtinDecorations.end() && decorations(builtin, spv::DecorationPerVertexKHR).empty(), "reading the I/J VGPRs with barycentric built-ins did not use BaryCoordKHR");
-        Require(std::ranges::none_of(builtin.fragmentParameters, [](const FragmentParameter& parameter) { return parameter.perVertex; }), "barycentric built-ins made a parameter per-vertex");
+        const auto hasBaryCoord = std::find(builtinDecorations.begin(), builtinDecorations.end(), static_cast<std::uint32_t>(spv::BuiltInBaryCoordKHR)) != builtinDecorations.end();
+        const auto perVertexDecorations = decorations(builtin, spv::DecorationPerVertexKHR);
+        Require(!builtin.barycentricEmulation.active && barycentricCapability(builtin) && hasBaryCoord, "reading the I/J VGPRs with barycentric built-ins did not emit BaryCoordKHR");
+        if (code[0] == 0xc8080000u) {
+            Require(!perVertexDecorations.empty() && std::ranges::any_of(builtin.fragmentParameters, [](const FragmentParameter& parameter) { return parameter.perVertex; }), "the mixed interpolation path lost the per-vertex input it interpolates with BaryCoordKHR");
+        } else {
+            Require(perVertexDecorations.empty() && std::ranges::none_of(builtin.fragmentParameters, [](const FragmentParameter& parameter) { return parameter.perVertex; }), "the I/J-only path decorated a parameter per-vertex");
+        }
     }
     Require(compile(interpolatesAndReadsIj, false).barycentricEmulation.active, "reading the I/J VGPRs next to v_interp_p1/p2 without the extension did not emulate barycentrics");
-    Require(compile(readsVertex, false, 0xffffffffu, true).barycentricEmulation.active, "v_interp_mov of P10 with only barycentric built-ins did not emulate per-vertex parameters");
+    {
+        const auto rv = compile(readsVertex, false, 0xffffffffu, true);
+        const auto rvPerV = decorations(rv, spv::DecorationPerVertexKHR);
+        Require(!rv.barycentricEmulation.active && barycentricCapability(rv) && !rvPerV.empty() && std::any_of(rv.fragmentParameters.begin(), rv.fragmentParameters.end(), [](const FragmentParameter& p) { return p.perVertex; }), "v_interp_mov of P10 with only barycentric built-ins lost its native per-vertex parameter");
+    }
     fragment = compile(readsVertex, false);
     Require(fragment.barycentricEmulation.active && !fragment.barycentricEmulation.smooth && fragment.fragmentParameters.size() == 1u && fragment.fragmentParameters[0].perVertex, "v_interp_mov of P10 did not emulate per-vertex parameters");
     Require(decorations(fragment, spv::DecorationLocation) == std::vector<std::uint32_t>{0u} && decorations(fragment, spv::DecorationPerVertexKHR).empty() && !decorations(fragment, spv::DecorationFlat).empty() && !barycentricCapability(fragment), "the emulated per-vertex parameter was not a flat array at the first free location");
@@ -10994,6 +11022,10 @@ ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = true;
+    static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     return ShaderRecompiler::Recompile(request);
@@ -11901,6 +11933,7 @@ void aliasedBufferViewTests() {
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     for (const auto& [words, views] : cases) {
         auto request = orderedPixelRequest(0x20600u, capabilities, words);
+        request.target.fragmentShaderBarycentricEnabled = false;
         request.target.supportedExtensions = extensions;
         request.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
         request.context.userDataBaseRegister = 0;
@@ -12890,6 +12923,7 @@ void unorm4_4_4_4TargetTests() {
         counting.context.pixel->iteratesSamples = true;
         counting.context.pixel->earlyZ = true;
         counting.target = merging.target;
+        counting.target.fragmentShaderBarycentricEnabled = false;
         counting.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
         static const std::array<std::uint32_t, 6> atomicCapabilities{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT, spv::CapabilityStorageImageReadWithoutFormat, spv::CapabilityStorageImageMultisample, spv::CapabilityInterpolationFunction, spv::CapabilityInt64};
         counting.target.supportedCapabilities = atomicCapabilities;
@@ -13778,6 +13812,10 @@ bool recompilesDebugBranch(std::uint32_t opcode) {
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
     request.target.fragmentShaderBarycentricEnabled = true;
+    static constexpr std::array<std::uint32_t, 2> capabilities{spv::CapabilityShader, spv::CapabilityFragmentBarycentricKHR};
+    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_fragment_shader_barycentric"};
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
