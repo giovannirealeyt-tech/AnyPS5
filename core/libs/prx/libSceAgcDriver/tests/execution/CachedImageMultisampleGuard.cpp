@@ -136,6 +136,7 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
         return draw ? resources->Revalidate(stages, report) : resources->Revalidate(shader, report);
     };
     ShaderResources::ProofReport proof;
+    const bool watchedBeforeProof = AgcDriver::GuestMemory::Watched(address, Side * Side * 4u);
     Require(revalidate(&proof), "the unchanged image resources failed their initial proof");
     const bool watched = AgcDriver::GuestMemory::Watched(address, Side * Side * 4u);
     const char* pathName = proof.path == ShaderResources::ProofPath::Fast ? "fast"
@@ -145,6 +146,8 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
         Require(proof.path == ShaderResources::ProofPath::Full, "with the fast image proof off the fixture did not take the full walk");
     } else if (sampled) {
         Require(proof.path == ShaderResources::ProofPath::Fast, "a sampled image over write-watched memory did not take the fast image proof");
+    } else if (!watchedBeforeProof || !watched) {
+        std::puts("image memory is compared, not watched: fast image proof not tested; checking the image guards through the full proof");
     }
     ColorTarget target{};
     target.address = address + BlockBytes;

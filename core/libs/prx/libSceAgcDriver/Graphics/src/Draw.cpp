@@ -1,8 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/CommandCounters.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/ResLookupProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -16,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StagedMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordingPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -54,7 +53,6 @@
 #include <mutex>
 #include <new>
 #include <set>
-#include <type_traits>
 #include <unordered_map>
 #include <type_traits>
 #include <utility>
@@ -2415,126 +2413,7 @@ bool drawStagingEnabled() {
     return !disabled;
 }
 
-template <typename F>
-auto resLookupTimed(ResLookupSample& sample, ResLookupSpan span, F&& fn) {
-    if (!sample.active) return fn();
-    const auto before = ResLookupNow();
-    if constexpr (std::is_void_v<std::invoke_result_t<F>>) {
-        fn();
-        sample.Span(span, before, ResLookupNow());
-    } else {
-        auto result = fn();
-        sample.Span(span, before, ResLookupNow());
-        return result;
-    }
-}
-
-void maybeReportResLookupSplit() {
-    static std::atomic<std::uint64_t> lastNs{0};
-    const auto now = ResLookupNow();
-    auto last = lastNs.load(std::memory_order_relaxed);
-    if (now - last < 10000000000ull) return;
-    if (!lastNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
-    const auto aggregate = TakeResLookupAggregate();
-    if (aggregate.calls == 0) return;
-    static constexpr std::array<const char*, ResLookupClassCount> classNames{"uncacheable", "findMiss", "fallback", "invalidated", "accepted", "unclassified"};
-    static constexpr std::array<const char*, ResLookupSpanCount> spanNames{"key", "find", "spaceRevalidate", "moved", "alias"};
-    AgcDriver::ProfilePrint_nid_no_patch("[reslookup] %llu resolveDrawResources calls (wall ns, leaf-lock waits included; TLS batches of %u, up to %u records per thread lost at exit):\n", static_cast<unsigned long long>(aggregate.calls), ResLookupFlushRecords, ResLookupFlushRecords - 1);
-    for (std::size_t c = 0; c < ResLookupClassCount; ++c) {
-        if (aggregate.classCount[c] == 0) continue;
-        char line[768];
-        int n = std::snprintf(line, sizeof(line), "[reslookup]   %s: calls %llu, total %llu ns", classNames[c], static_cast<unsigned long long>(aggregate.classCount[c]), static_cast<unsigned long long>(aggregate.classTotalNs[c]));
-        for (std::size_t s = 0; s < ResLookupSpanCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++s) {
-            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ", %s %llu ns / %llu calls", spanNames[s], static_cast<unsigned long long>(aggregate.spanNs[c][s]), static_cast<unsigned long long>(aggregate.spanCalls[c][s]));
-        }
-        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ", resid %+lld ns", static_cast<long long>(ResLookupResidualNs(aggregate, static_cast<ResLookupClass>(c))));
-        AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
-    }
-    if (aggregate.shapeErrors != 0) AgcDriver::ProfilePrint_nid_no_patch("[reslookup]   shape errors: %llu\n", static_cast<unsigned long long>(aggregate.shapeErrors));
-    if (aggregate.clockViolations != 0) AgcDriver::ProfilePrint_nid_no_patch("[reslookup]   clock violations: %llu\n", static_cast<unsigned long long>(aggregate.clockViolations));
-    const auto uncacheable = static_cast<std::size_t>(ResLookupClass::Uncacheable);
-    if (aggregate.classCount[uncacheable] != 0) {
-        std::uint64_t reasons = 0;
-        char line[256];
-        int n = std::snprintf(line, sizeof(line), "[reslookup]   uncacheable reasons:");
-        for (std::size_t r = 1; r < ResLookupUncacheableReasonCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++r) {
-            reasons += aggregate.uncacheableReason[r];
-            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", ResLookupUncacheableReasonNames[r], static_cast<unsigned long long>(aggregate.uncacheableReason[r]));
-        }
-        if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; none %llu, sum %llu / calls %llu", static_cast<unsigned long long>(aggregate.uncacheableReason[0]), static_cast<unsigned long long>(reasons), static_cast<unsigned long long>(aggregate.classCount[uncacheable]));
-        AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
-    }
-    if (SpaceSplitEnabled()) {
-        static constexpr std::array<const char*, SpacePhaseCount> phaseNames{"initial", "completion", "firstFast", "decision", "refresh", "retry", "audit", "walk", "diagnosticWalk", "buffer", "bookkeeping"};
-        static constexpr std::array<const char*, SpaceOutcomeCount> outcomeNames{"notInvoked", "notReached", "skippedSpaceHeld", "rejectImageViews", "rejectNotReusable", "epochHit", "epochDiagnosticHit", "epochDiagnosticFailure", "fastHit", "ownRefreshedHit", "fullWalkHit", "walkFailure", "bufferFailure"};
-        AgcDriver::ProfilePrint_nid_no_patch("[resspace] enabled %llu invoked %llu success %llu clock %llu incoherent %llu (wall ns, phase waits included; TLS, up to 63 records per thread lost at exit):\n", static_cast<unsigned long long>(aggregate.space.enabled), static_cast<unsigned long long>(aggregate.space.invoked), static_cast<unsigned long long>(aggregate.space.success), static_cast<unsigned long long>(aggregate.space.clockViolations), static_cast<unsigned long long>(aggregate.space.incoherent));
-        for (std::size_t c = 0; c < ResLookupClassCount; ++c) {
-            if (aggregate.space.outcome[c][0] == 0 && aggregate.space.spanNs[c] == 0) {
-                bool any = false;
-                for (std::size_t o = 1; o < SpaceOutcomeCount; ++o) if (aggregate.space.outcome[c][o] != 0) any = true;
-                if (!any) continue;
-            }
-            char line[1024];
-            int n = std::snprintf(line, sizeof(line), "[resspace]   %s: outcomes", classNames[c]);
-            for (std::size_t o = 0; o < SpaceOutcomeCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++o) {
-                if (aggregate.space.outcome[c][o] == 0) continue;
-                n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%llu", outcomeNames[o], static_cast<unsigned long long>(aggregate.space.outcome[c][o]));
-            }
-            if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; span %llu ns, resid %+lld ns", static_cast<unsigned long long>(aggregate.space.spanNs[c]), static_cast<long long>(aggregate.space.residualNs[c]));
-            for (std::size_t p = 0; p < SpacePhaseCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++p) {
-                n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; %s %llu ns / %llu", phaseNames[p], static_cast<unsigned long long>(aggregate.space.phaseNs[c][p]), static_cast<unsigned long long>(aggregate.space.phaseCalls[c][p]));
-            }
-            AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
-            for (int pass = 0; pass < 2; ++pass) {
-                const FastStats& fast = pass == 0 ? aggregate.space.fastFirst[c] : aggregate.space.fastRetry[c];
-                const TextureStats& texture = pass == 0 ? aggregate.space.textureFirst[c] : aggregate.space.textureRetry[c];
-                if (fast.invocations == 0) continue;
-                char fastLine[1024];
-                int m = std::snprintf(fastLine, sizeof(fastLine), "[resspace]   %s: %s inv %llu eachFallback %llu textures %llu storage %llu queries %llu pending %llu serialUnchanged %llu serialChanged %llu", classNames[c], pass == 0 ? "fastFirst" : "fastRetry", static_cast<unsigned long long>(fast.invocations), static_cast<unsigned long long>(fast.eachFallback), static_cast<unsigned long long>(fast.textures), static_cast<unsigned long long>(fast.storage), static_cast<unsigned long long>(fast.queries), static_cast<unsigned long long>(fast.pending), static_cast<unsigned long long>(fast.pendingSerialUnchanged), static_cast<unsigned long long>(fast.pendingSerialChanged));
-                for (std::size_t p = 0; p < FastPartCount && m > 0 && static_cast<std::size_t>(m) < sizeof(fastLine); ++p) {
-                    m += std::snprintf(fastLine + m, sizeof(fastLine) - static_cast<std::size_t>(m), "; %s %llu ns / %llu", FastPartNames[p], static_cast<unsigned long long>(fast.ns[p]), static_cast<unsigned long long>(fast.calls[p]));
-                }
-                AgcDriver::ProfilePrint_nid_no_patch("%s\n", fastLine);
-                char textureLine[1024];
-                int t = std::snprintf(textureLine, sizeof(textureLine), "[resspace]   %s: %s visits %llu pendingCalls %llu depth %llu source %llu snapshot %llu collectZero %llu refresh %llu compare %llu proofScan %llu", classNames[c], pass == 0 ? "textureFirst" : "textureRetry", static_cast<unsigned long long>(fast.textures), static_cast<unsigned long long>(texture.pendingCalls), static_cast<unsigned long long>(texture.depth), static_cast<unsigned long long>(texture.source), static_cast<unsigned long long>(texture.snapshot), static_cast<unsigned long long>(texture.collectZero), static_cast<unsigned long long>(texture.refresh), static_cast<unsigned long long>(texture.compare), static_cast<unsigned long long>(texture.proofScan));
-                if (texture.collectCalls != 0 || texture.collectMemoHits != 0 || texture.collectWalkAttempted != 0) {
-                    if (t > 0 && static_cast<std::size_t>(t) < sizeof(textureLine)) t += std::snprintf(textureLine + t, sizeof(textureLine) - static_cast<std::size_t>(t), " | collect calls %llu memoHits %llu (eMap %llu thrd %llu shrd %llu) walkAttempt %llu walkFail %llu earlyExit %llu", static_cast<unsigned long long>(texture.collectCalls), static_cast<unsigned long long>(texture.collectMemoHits), static_cast<unsigned long long>(texture.collectMemoHitEpochMap), static_cast<unsigned long long>(texture.collectMemoHitThread), static_cast<unsigned long long>(texture.collectMemoHitShared), static_cast<unsigned long long>(texture.collectWalkAttempted), static_cast<unsigned long long>(texture.collectWalkFailed), static_cast<unsigned long long>(texture.collectEarlyExitPreWalk));
-                }
-                for (std::size_t p = 0; p < TexturePartCount && t > 0 && static_cast<std::size_t>(t) < sizeof(textureLine); ++p) {
-                    t += std::snprintf(textureLine + t, sizeof(textureLine) - static_cast<std::size_t>(t), "; %s %llu ns / %llu", TexturePartNames[p], static_cast<unsigned long long>(texture.ns[p]), static_cast<unsigned long long>(texture.calls[p]));
-                }
-                AgcDriver::ProfilePrint_nid_no_patch("%s\n", textureLine);
-                // FT17-C timing companion: a versioned line of its own so the legacy texture
-                // line above stays byte-identical and the Python audit parser (which matches
-                // the exact "[resspace]" substring) skips it. Emitted right after the texture
-                // line of the same class/pass, inside the same window header, so class, pass
-                // and window are unambiguous from the nearest [resspace] header above it.
-                const bool timingOn = AgcDriver::GuestMemory::TextureCollectTimingEnabled();
-                char timingLine[1024];
-                if (timingOn) {
-                    const auto sumTiming = texture.collectNsMemoHit + texture.collectNsWalk + texture.collectNsEarlyExit;
-                    const auto collectSectionNs = texture.ns[static_cast<std::size_t>(TexturePart::Collect)];
-                    // The residual is a derived difference, not an independent check: the two raw
-                    // quantities are both reported, and a bucket sum above the section time raises
-                    // a separate mismatch flag (never folded into clockViolations, never clamped).
-                    const auto timingMismatch = static_cast<std::uint64_t>(sumTiming > collectSectionNs);
-                    int w = std::snprintf(timingLine, sizeof(timingLine), "[resspace-timing-v1]   %s: %s timing on coverage=all instrumentedCalls %llu nsMemoHit %llu nsWalk %llu nsEarlyExit %llu sumTimingNs %llu collectSectionNs %llu timingMismatch %llu clockViolations %llu", classNames[c], pass == 0 ? "textureFirst" : "textureRetry", static_cast<unsigned long long>(texture.collectCalls), static_cast<unsigned long long>(texture.collectNsMemoHit), static_cast<unsigned long long>(texture.collectNsWalk), static_cast<unsigned long long>(texture.collectNsEarlyExit), static_cast<unsigned long long>(sumTiming), static_cast<unsigned long long>(collectSectionNs), static_cast<unsigned long long>(timingMismatch), static_cast<unsigned long long>(texture.collectClockViolations));
-                    static_cast<void>(w);
-                } else {
-                    int w = std::snprintf(timingLine, sizeof(timingLine), "[resspace-timing-v1]   %s: %s timing off coverage=none (gate APS5_TEXTURE_COLLECT_TIMING unset: no clock readings were taken, no bucket is a measured zero)", classNames[c], pass == 0 ? "textureFirst" : "textureRetry");
-                    static_cast<void>(w);
-                }
-                AgcDriver::ProfilePrint_nid_no_patch("%s\n", timingLine);
-            }
-        }
-    }
-}
-
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer) {
-    const bool resLookupEnabled = ResLookupSplitEnabled();
-    ResLookupSample resLookup(resLookupEnabled);
-    resLookup.Begin();
-    resLookup.NoteGate(recordable, plan.candidate, plan.keyed);
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -2553,14 +2432,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
-        resLookup.NoteCacheable();
-        resolved.contentKey = resLookupTimed(resLookup, ResLookupSpan::Key, [&] {
-            return plan.contentKey;
-        });
-        auto cached = resLookupTimed(resLookup, ResLookupSpan::Find, [&] { return SharedResourceCache().Find(*resolved.contentKey); });
-        resLookup.NoteFindHit(cached != nullptr);
-        if (cached) {
-            resLookup.SpanBegin();
+        resolved.contentKey = plan.contentKey;
+        if (auto cached = SharedResourceCache().Find(*resolved.contentKey)) {
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2592,22 +2465,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            SpaceData spaceData;
-            SpaceProbeScope spaceScope(&spaceData);
-            SpaceInvocationGuard spaceInvocation;
             const bool valid = spaceHeld && cached->Revalidate(shaders);
-            if (!spaceHeld) SpaceSetSkipped(SpaceOutcome::SkippedSpaceHeld);
-            spaceScope.Finalize();
-            resLookup.record.space = spaceData;
-            resLookup.SpanEnd(ResLookupSpan::SpaceRevalidate);
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
-            if (valid && recorder != nullptr) moved = resLookupTimed(resLookup, ResLookupSpan::Moved, [&] { return cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched); });
+            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
             if (moved.has_value()) {
-                resLookup.Note(ResLookupClass::Accepted);
-                if (trimKey) resLookupTimed(resLookup, ResLookupSpan::Alias, [&] { CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes); });
+                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 if (counted && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, snapshots, indexBytes, *cached);
                 static_cast<void>(heldSpace.release());
                 resolved.resources = std::move(cached);
@@ -2616,11 +2481,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
-                resLookup.Note(ResLookupClass::Fallback);
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
+                countCache(&DrawProfile::cacheMisses);
             } else {
-                resLookup.Note(ResLookupClass::Invalidated);
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(*resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
@@ -2629,9 +2493,6 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     } else {
         countCache(&DrawProfile::uncacheable);
     }
-    resLookup.Finish();
-    if (resLookupEnabled) maybeReportResLookupSplit();
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResLookup);
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
@@ -2642,7 +2503,6 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (address == AddressStages::ReadOnly && !reuse.has_value()) reuse = resolved.resources->SpaceReuse() ? AddressDrawReuse::Built : AddressDrawReuse::NotSpaceOnly;
     }
     if (reuse.has_value()) countAddressDrawReuse(*reuse);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResBuild);
     timer.phase(PhaseResources);
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
     return resolved;
@@ -2790,7 +2650,6 @@ void NoteGuestWorkIn(const Context& context, VkCommandBuffer commands) {
 }
 
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, const DrawTraceContext* trace, std::uint32_t& subdraw, std::optional<std::uint32_t> pieceFirstIndex = std::nullopt) {
-    ++Graphics::commandCallCounters().drawCalls;
     if (recordDrawCommandsImpl(context, commands, state, draw, inputs, indirect, argumentBuffer, argumentOffset, trace, subdraw, pieceFirstIndex)) NoteGuestWorkIn(context, commands);
 }
 
@@ -3256,6 +3115,14 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+bool ParallelAtlasEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_PARALLEL_ATLAS");
+        return text != nullptr && text[0] != '\0' && text[0] != '0' && std::getenv("APS5_PROFILE_GPU_DRAWS") == nullptr;
+    }();
+    return enabled;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, BorrowedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -3328,7 +3195,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::DescWrites);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -3359,7 +3225,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
-    const auto start = recorder->StartDrawPass(passKey, inputs.indexInputBehindGpuWrite || capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const bool parallelThis = ParallelAtlasEnabled() && !DrawFaultTokens() && state.depth.has_value() && !state.hasColorTarget && state.samples == 1u && !state.rasterizerDiscard && record.pipeline->DynamicRendering() && !record.pipeline->BindsColor() && !recorder->CountingSamples() && !gpuIndirect && !meshIndirect && !captured;
+    const auto start = recorder->StartDrawPass(passKey, inputs.indexInputBehindGpuWrite || capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess, parallelThis);
     if (record.spaceKeep != nullptr) *record.spaceKeep = reserveSpaceKeep(*recorder, resources);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
@@ -3396,71 +3263,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
-    if (continued) {
-        record.pipeline->Continue(recording, state, record.masked);
-    } else {
-        for (const auto& proxy : record.proxies) {
-            proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
-            countBarrier(2);
-        }
-        if (start.barrier) {
-            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
-            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
-            countBarrier(1);
-        }
-        APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
-        if (inputs.vertexInputBehindGpuWrite || inputs.indexInputBehindGpuWrite) {
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, (inputs.vertexInputBehindGpuWrite ? VkAccessFlags{VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT} : VkAccessFlags{0}) | (inputs.indexInputBehindGpuWrite ? VkAccessFlags{VK_ACCESS_INDEX_READ_BIT} : VkAccessFlags{0}));
-            countBarrier(1);
-        }
-        const auto pixelLdsSubgroup = PixelFunctionLdsSubgroup(shaders);
-        if (pixelLdsSubgroup != 0u) PreparePixelFunctionLds(context, commands, pixelLdsSubgroup);
-        if (captured) {
-            recordCaptureBarrier(context, commands);
-            countBarrier(1);
-            meshArguments = state.tessellationCapture->header;
-            argumentBuffer = meshArguments->Handle();
-        } else if (meshIndirect) {
-            meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
-            argumentBuffer = meshArguments->Handle();
-        } else if (gpuIndirect) {
-            rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentSnapshot, argumentBuffer, argumentOffset, countBarrier);
-        }
-        // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
-        // layout, which a lean draw renders in: no transitions.
-        if (!record.reordered.empty()) {
-            std::vector<std::shared_ptr<void>> kept;
-            RecordSampleOrder(context, recording, record.reorderPass, record.reordered, true, kept);
-            for (auto& object : kept) recorder->Keep(std::move(object));
-        }
-        for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
-        APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        Graphics::CommitSplitMarkBegin();
-        record.pipeline->Begin(recording, *record.framebuffer, state.renderExtent, state, record.masked);
-        Graphics::CommitSplitMark(Graphics::CommitSplitPhase::PassBegin);
-    }
-    APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
-    if (drawBindings != nullptr) {
-        const auto set = drawBindings->allocation.set;
-        const auto fragmentSet = drawBindings->fragmentAllocation.set;
-        if (set != VK_NULL_HANDLE) {
-            Graphics::NoteDescriptorSetBind(commands, static_cast<const void*>(record.pipeline->Layout()), static_cast<const void*>(set), false);
-            context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
-        }
-        if (fragmentSet != VK_NULL_HANDLE) {
-            Graphics::NoteDescriptorSetBind(commands, static_cast<const void*>(record.pipeline->Layout()), static_cast<const void*>(fragmentSet), true);
-            context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
-        }
-    } else {
-        resources.BindDrawUse(commands, record.pipeline->Layout(), drawUse.get());
-    }
-    Graphics::CommitSplitMarkSets();
-    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
-    if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
-    APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    Graphics::CommitSplitMarkLds();
-    // A draw whose arguments moved keeps the push constants in step with the new values: the
-    // constants are rebuilt (when the draw carries none) and patched in place (upstream).
+    static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    auto eachDrawTiming = Recorder::NoTiming;
     std::array<std::byte, PipelinePushConstantBytes> movedPush;
     const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = record.pushBytes;
     VkShaderStageFlags pushStages = record.pushStages;
@@ -3472,11 +3276,66 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             pushBytes = &movedPush;
         }
     }
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, pushBytes, pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
-    Graphics::CommitSplitMarkRecord();
+    const auto recordPassOpen = [&](CommandState& rec, bool secondaryContents) {
+    const auto cb = rec.Commands();
+    if (continued) {
+        record.pipeline->Continue(rec, state, record.masked);
+    } else {
+        for (const auto& proxy : record.proxies) {
+            proxy->RecordAttachmentProxyLoad(cb, VK_IMAGE_LAYOUT_GENERAL);
+            countBarrier(2);
+        }
+        if (start.barrier) {
+            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+            countBarrier(1);
+        }
+        APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
+        if (inputs.vertexInputBehindGpuWrite || inputs.indexInputBehindGpuWrite) {
+            RecordMemoryBarrier(context, cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, (inputs.vertexInputBehindGpuWrite ? VkAccessFlags{VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT} : VkAccessFlags{0}) | (inputs.indexInputBehindGpuWrite ? VkAccessFlags{VK_ACCESS_INDEX_READ_BIT} : VkAccessFlags{0}));
+            countBarrier(1);
+        }
+        const auto pixelLdsSubgroup = PixelFunctionLdsSubgroup(shaders);
+        if (pixelLdsSubgroup != 0u) PreparePixelFunctionLds(context, cb, pixelLdsSubgroup);
+        if (captured) {
+            recordCaptureBarrier(context, cb);
+            countBarrier(1);
+            meshArguments = state.tessellationCapture->header;
+            argumentBuffer = meshArguments->Handle();
+        } else if (meshIndirect) {
+            meshArguments = recordMeshArguments(context, cb, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
+            argumentBuffer = meshArguments->Handle();
+        } else if (gpuIndirect) {
+            rewritten = recordIndirectArguments(context, cb, recorder, true, *record.indirect, scratch, argumentSnapshot, argumentBuffer, argumentOffset, countBarrier);
+        }
+        // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
+        // layout, which a lean draw renders in: no transitions.
+        if (!record.reordered.empty()) {
+            std::vector<std::shared_ptr<void>> kept;
+            RecordSampleOrder(context, rec, record.reorderPass, record.reordered, true, kept);
+            for (auto& object : kept) recorder->Keep(std::move(object));
+        }
+        for (const auto& write : record.staged) RecordStagedClear(context, cb, *write.temporary);
+        APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+        record.pipeline->Begin(rec, *record.framebuffer, state.renderExtent, state, record.masked, secondaryContents);
+    }
+    };
+    const auto recordBody = [&](CommandState& rec) {
+    const auto cb = rec.Commands();
+    APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    if (drawBindings != nullptr) {
+        const auto set = drawBindings->allocation.set;
+        const auto fragmentSet = drawBindings->fragmentAllocation.set;
+        if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
+        if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
+    } else {
+        resources.BindDrawUse(cb, record.pipeline->Layout(), drawUse.get());
+    }
+    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, cb, record.pipeline->Layout());
+    if (UsesMeshWindow(shaders)) BindMeshWindow(context, cb, record.pipeline->Layout());
+    APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+    pushDrawConstants(*record.pipeline, cb, state, draw, shaders, resources, pushBytes, pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
-    static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
-    auto eachDrawTiming = Recorder::NoTiming;
     if (timeEachDraw && Recorder::GpuTimingEnabled()) {
         if (Recorder::DrawStageTimingEnabled()) {
             std::vector<std::pair<std::uint32_t, std::uint64_t>> stages;
@@ -3492,24 +3351,45 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             eachDrawTiming = recorder->BeginInPassGpuTiming(Recorder::DrawTimingKey(key));
         }
     }
-    noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), record.indirect != nullptr ? record.indirect->args : nullptr);
-    if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
+    noteDrawFaultToken(context, *recorder, cb, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), record.indirect != nullptr ? record.indirect->args : nullptr);
+    if (record.stencilReplay.empty()) recordDrawCommands(context, cb, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
-        recordStencilReplay(context, recording, state, record.masked, draw, inputs, record.stencilReplay, shaders, resources, pushBytes, pushStages);
+        recordStencilReplay(context, rec, state, record.masked, draw, inputs, record.stencilReplay, shaders, resources, pushBytes, pushStages);
         for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
     }
     if (record.pipeline->SplitsFaces()) {
-        record.pipeline->ContinueBackFaces(recording, state, record.masked);
-        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
+        record.pipeline->ContinueBackFaces(rec, state, record.masked);
+        recordDrawCommands(context, cb, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
     if (record.pipeline->SplitsSecondChannel()) {
-        record.pipeline->ContinueSecondChannel(recording, state, record.masked);
-        recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
+        record.pipeline->ContinueSecondChannel(rec, state, record.masked);
+        recordDrawCommands(context, cb, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
+    };
+    if (parallelThis) {
+        if (!continued) recordPassOpen(recording, true);
+        auto& pool = DeviceRecordingPool(context);
+        const auto depthFormat = record.pipeline->DepthFormat();
+        const RecordingPool::Inheritance inheritance{depthFormat, HasStencil(depthFormat) ? depthFormat : VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, record.pipeline->ColorSlotCount()};
+        OrderedAssembly<RecordingPool::Result> assembly;
+        const auto sequence = assembly.Reserve();
+        pool.Record(assembly, sequence, inheritance, [&](VkCommandBuffer cb) {
+            CommandState pooled;
+            pooled.Begin(cb);
+            record.pipeline->Continue(pooled, state, record.masked);
+            recordBody(pooled);
+        });
+        auto result = assembly.Take(sequence);
+        if (result.error != nullptr) std::rethrow_exception(result.error);
+        recording.ExecuteCommands(context, 1, &result.commands);
+        recorder->Keep(std::move(result.release));
+    } else {
+        recordPassOpen(recording, false);
+        recordBody(recording);
+    }
+
     recorder->EndGpuTiming(eachDrawTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
-    Graphics::CommitSplitMarkDraw();
-    // The indirect arguments snapshot (upstream) outlives the draw it fed.
     if (argumentSnapshot != nullptr) recorder->Keep(argumentSnapshot);
     if (state.tessellationCapture != nullptr) {
         recorder->Keep(state.tessellationCapture->header);
@@ -3538,7 +3418,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
-    recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies), parallelThis);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, record.pipeline, record.framebuffer, inputs, record.targets, record.targetSlices, state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
@@ -4342,7 +4222,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.contentKey);
     if (plan.nothing) return false;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Inputs);
     if (inputs.nothing) {
         if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
         return false;
@@ -4571,8 +4450,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             ThreadTargetMemo().Invalidate();
         }
     }
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Targets);
-    // Upstream's attachment verifier runs after the target views exist.
     if (verifyAttachments) checkAttachments(state, prepared);
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -4605,11 +4482,17 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             Require(!imageRead && !resources->ReadsImage(target.resident.get()) && !resources->ReadsOverlap(target.color.MemoryAddress(), static_cast<std::size_t>(target.color.bytes)) && !inputOverlaps(target.color.MemoryAddress(), target.color.bytes), "stencil replay refuses attachment feedback reads");
         }
         if (state.depth) {
-            const auto bytes = static_cast<std::size_t>(state.depth->extent.width) * state.depth->extent.height * 4u * std::max(state.depth->samples, 1u);
-            Require(!resources->ReadsOverlap(state.depth->address, bytes) && !resources->ReadsOverlap(state.depth->stencilAddress, bytes) && !inputOverlaps(state.depth->address, bytes) && !inputOverlaps(state.depth->stencilAddress, bytes), "stencil replay refuses depth or stencil feedback reads");
+            const bool d16 = state.depth->format == VK_FORMAT_D16_UNORM || state.depth->format == VK_FORMAT_D16_UNORM_S8_UINT;
+            const auto planeBytes = [&](std::uint32_t bytesPerTexel) {
+                return static_cast<std::size_t>(state.depth->samples > 1u ? MultisampledDepthBytes_nid_no_patch(state.depth->extent, bytesPerTexel, state.depth->samples) : DepthSliceBytes(state.depth->extent, bytesPerTexel));
+            };
+            const auto depthBytes = planeBytes(d16 ? 2u : 4u);
+            const auto stencilBytes = state.depth->stencilAddress != 0u ? planeBytes(1u) : std::size_t{0};
+            const auto planeRead = [&](std::uint64_t plane, std::size_t length) { return length != 0u && (resources->ReadsOverlap(plane, length) || inputOverlaps(plane, length)); };
+            Require(!planeRead(state.depth->address, depthBytes) && !planeRead(state.depth->stencilAddress, stencilBytes), "stencil replay refuses depth or stencil feedback reads");
             const auto boundPlane = [&](std::uint64_t address, std::uint64_t length) {
-                const auto overlaps = [&](std::uint64_t plane) { return plane != 0u && address < plane + bytes && plane < address + length; };
-                return overlaps(state.depth->address) || overlaps(state.depth->stencilAddress);
+                const auto overlaps = [&](std::uint64_t plane, std::uint64_t planeLength) { return plane != 0u && planeLength != 0u && address < plane + planeLength && plane < address + length; };
+                return overlaps(state.depth->address, depthBytes) || overlaps(state.depth->stencilAddress, stencilBytes);
             };
             for (const auto& shader : shaders) {
                 for (const auto& binding : shader.program->bindings) {
@@ -4811,7 +4694,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (!repeated && pipeline == nullptr) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Pipeline);
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     auto& owners = prepared.owners;
@@ -4836,7 +4718,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
     }
     prepared.depthLocations = passDepthLocations(context, pipelineState, *pipeline);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Framebuffer);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
@@ -5315,7 +5196,6 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
-    const Graphics::CommitSplitScope commitSplit(0);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
@@ -5439,7 +5319,6 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
-    const Graphics::CommitSplitScope commitSplit(1);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -5471,7 +5350,6 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     DrawInputs inputs;
     if (plan.nothing) inputs.nothing = true;
     else inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Inputs);
     if (inputs.nothing) {
         result.recorded = true;
         return result;
@@ -5523,7 +5401,6 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
             checkAttachmentViews(state, recipe.targetViews, [&](std::size_t index) { return matchedTargets[index]; });
         }
     }
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Targets);
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
@@ -5548,7 +5425,6 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::ResLookup);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();
     outcome.recorded = true;
@@ -5564,8 +5440,6 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         const std::vector<std::shared_ptr<void>> framebufferOwners(stored.begin(), stored.end());
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     }
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Pipeline);
-    Graphics::CommitSplitMark(Graphics::CommitSplitPhase::Framebuffer);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     BorrowedDraw record{resources, pipeline, framebuffer};

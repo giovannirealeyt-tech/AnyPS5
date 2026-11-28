@@ -300,7 +300,7 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
             const auto info = Io::ReadU64(bytes, offset + index + 8);
             const auto relocation = static_cast<std::uint32_t>(info);
             if (relocation == 0) continue;
-            if ((info >> 32) >= image.Symbols.size() || (plt && relocation != 7) || (relocation != 1 && relocation != 6 && relocation != 7 && relocation != 8 && relocation != 16 && relocation != 17 && relocation != 18)) fail("Unsupported relocation or symbol index");
+            if ((info >> 32) >= image.Symbols.size() || (plt && relocation != 7) || (relocation != 1 && relocation != 6 && relocation != 7 && relocation != 8 && relocation != 10 && relocation != 16 && relocation != 17 && relocation != 18)) fail("Unsupported relocation or symbol index");
             const auto& referencedSymbol = image.Symbols[info >> 32];
             if (relocation != 8 && referencedSymbol.Section == 0 && (referencedSymbol.Info >> 4) == 0 && (referencedSymbol.Visibility & 3) != 0)
                 fail("Undefined local symbol has non-default visibility: " + referencedSymbol.Name);
@@ -331,6 +331,9 @@ GuestImage GuestImageReader::Read(const std::filesystem::path& path, std::vector
                     continue;
                 }
                 relativeAddress(addend);
+            } else if (relocation == 10) {
+                if ((info >> 32) != 0) fail("R_X86_64_32 relocation with a symbol");
+                if (addend > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) fail("R_X86_64_32 addend does not fit in 32 bits");
             } else if (relocation == 1 || relocation == 6 || relocation == 7) {
                 const auto& symbol = image.Symbols[info >> 32];
                 if ((info >> 32) == 0 || (symbol.Info & 15) == 6 || (relocation == 7 && addend != 0) || (symbol.Section == 0 && symbol.Name.empty())) fail("Invalid guest symbol relocation");
